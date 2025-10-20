@@ -1,0 +1,16 @@
+mainmenu "LwM2M Base Client"
+
+config NET_SAMPLE_LWM2M_ID
+	string "LwM2M client endpoint"
+	default ""
+	help
+	  Endpoint name used when registering to the server. Leave empty to use
+	  CONFIG_BOARD.
+
+config NET_SAMPLE_LWM2M_SERVER
+	string "LwM2M server URI"
+	default "coap://leshan.eclipseprojects.io:5683"
+	help
+	  Complete URI of the LwM2M server, for example "coap://1.2.3.4:5683".
+
+source "Kconfig.zephyr"
