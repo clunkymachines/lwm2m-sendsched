@@ -62,7 +62,7 @@
         <Type>String</Type>
         <RangeEnumeration></RangeEnumeration>
         <Units></Units>
-        <Description>LwM2M resource path to monitor, e.g. /3303/0/5700.</Description>
+        <Description>LwM2M resource path to monitor, e.g. /3303/0/5700. The value must reference a resource (/Object/Instance/Resource) with numeric segments.</Description>
       </Item>
       <Item ID="1">
         <Name>collection rules</Name>
@@ -72,7 +72,7 @@
         <Type>String</Type>
         <RangeEnumeration></RangeEnumeration>
         <Units></Units>
-        <Description>Rule strings such as pmin=10, gt=25, lt=5, epmin=60, etc.</Description>
+        <Description>Rule strings formatted as attribute=value. Supported attributes are pmin, pmax, epmin, epmax (integer values) and gt, lt, st (floating point values). Each attribute may appear at most once per instance.</Description>
       </Item>
     </Resources>
     <Description2></Description2>

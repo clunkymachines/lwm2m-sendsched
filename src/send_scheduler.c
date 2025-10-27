@@ -1,8 +1,11 @@
 #include "send_scheduler.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/lwm2m.h>
 #include <zephyr/sys/util.h>
@@ -46,6 +49,12 @@ static int32_t scheduler_max_age;
 
 static struct send_sched_rule_entry rule_entries[SEND_SCHED_RULES_MAX_INSTANCES];
 
+static int send_sched_validate_path(uint16_t obj_inst_id, uint16_t res_id,
+				    uint16_t res_inst_id, uint8_t *data, uint16_t data_len,
+				    bool last_block, size_t total_size, size_t offset);
+static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
+				    uint16_t res_inst_id, uint8_t *data, uint16_t data_len,
+				    bool last_block, size_t total_size, size_t offset);
 static struct lwm2m_engine_obj send_sched_ctrl_obj;
 static struct lwm2m_engine_obj_field send_sched_ctrl_fields[] = {
 	OBJ_FIELD(SEND_SCHED_CTRL_RES_PAUSED, RW, BOOL),
@@ -63,6 +72,7 @@ static struct lwm2m_engine_obj_inst *send_sched_ctrl_create(uint16_t obj_inst_id
 	int j = 0;
 
 	if (created || obj_inst_id != 0U) {
+		LOG_WRN("Scheduler control instance %u already exists or not 0", obj_inst_id);
 		return NULL;
 	}
 
@@ -99,6 +109,275 @@ static struct lwm2m_engine_res_inst send_sched_rules_res_inst[SEND_SCHED_RULES_M
 							     [SEND_SCHED_RULES_RES_INST_COUNT];
 static struct lwm2m_engine_obj_inst send_sched_rules_inst[SEND_SCHED_RULES_MAX_INSTANCES];
 
+static int send_sched_rules_index_for_inst(uint16_t obj_inst_id)
+{
+	for (int idx = 0; idx < SEND_SCHED_RULES_MAX_INSTANCES; idx++) {
+		if (send_sched_rules_inst[idx].obj &&
+		    send_sched_rules_inst[idx].obj_inst_id == obj_inst_id) {
+			return idx;
+		}
+	}
+
+	return -1;
+}
+
+static bool send_sched_attribute_requires_integer(const char *attr)
+{
+	return (!strcmp(attr, "pmin") || !strcmp(attr, "pmax") ||
+		!strcmp(attr, "epmin") || !strcmp(attr, "epmax"));
+}
+
+static bool send_sched_attribute_requires_float(const char *attr)
+{
+	return (!strcmp(attr, "gt") || !strcmp(attr, "lt") || !strcmp(attr, "st"));
+}
+
+static bool send_sched_is_valid_integer(const char *value)
+{
+	char *end = NULL;
+	long parsed;
+
+	if (value == NULL || *value == '\0') {
+		return false;
+	}
+
+	errno = 0;
+	parsed = strtol(value, &end, 10);
+	if (errno == ERANGE) {
+		return false;
+	}
+
+	if (end == value || (end && *end != '\0')) {
+		return false;
+	}
+
+	ARG_UNUSED(parsed);
+
+	return true;
+}
+
+static bool send_sched_is_valid_float(const char *value)
+{
+	char *end = NULL;
+	double parsed;
+
+	if (value == NULL || *value == '\0') {
+		return false;
+	}
+
+	errno = 0;
+	parsed = strtod(value, &end);
+	if (errno == ERANGE) {
+		return false;
+	}
+
+	if (end == value || (end && *end != '\0')) {
+		return false;
+	}
+
+	ARG_UNUSED(parsed);
+
+	return true;
+}
+
+static bool send_sched_attribute_is_allowed(const char *attr)
+{
+	return send_sched_attribute_requires_integer(attr) ||
+	       send_sched_attribute_requires_float(attr);
+}
+
+static int send_sched_validate_path(uint16_t obj_inst_id, uint16_t res_id,
+				    uint16_t res_inst_id, uint8_t *data, uint16_t data_len,
+				    bool last_block, size_t total_size, size_t offset)
+{
+	char path_buf[SEND_SCHED_RULE_STRING_SIZE];
+	size_t copy_len;
+	int segments = 0;
+
+	ARG_UNUSED(obj_inst_id);
+	ARG_UNUSED(res_id);
+	ARG_UNUSED(res_inst_id);
+	ARG_UNUSED(last_block);
+	ARG_UNUSED(total_size);
+	ARG_UNUSED(offset);
+
+	if (!data || data_len == 0) {
+		LOG_WRN("Sampling rule path cannot be empty");
+		return -EINVAL;
+	}
+
+	if (data_len >= sizeof(path_buf)) {
+		LOG_WRN("Sampling rule path too long (%u)", data_len);
+		return -ENOBUFS;
+	}
+
+	copy_len = MIN((size_t)data_len, sizeof(path_buf) - 1U);
+	memcpy(path_buf, data, copy_len);
+	path_buf[copy_len] = '\0';
+
+	if (path_buf[0] != '/') {
+		LOG_WRN("Sampling rule path must start with '/'");
+		return -EINVAL;
+	}
+
+	for (char *cursor = path_buf + 1; *cursor != '\0';) {
+		char *next = strchr(cursor, '/');
+		size_t seg_len = next ? (size_t)(next - cursor) : strlen(cursor);
+
+		if (seg_len == 0) {
+			LOG_WRN("Sampling rule path contains empty segment");
+			return -EINVAL;
+		}
+
+		for (size_t idx = 0; idx < seg_len; idx++) {
+			if (!isdigit((unsigned char)cursor[idx])) {
+				LOG_WRN("Sampling rule path segment must be numeric");
+				return -EINVAL;
+			}
+		}
+
+		segments++;
+		if (!next) {
+			break;
+		}
+		cursor = next + 1;
+	}
+
+	if (segments != 3) {
+		LOG_WRN("Sampling rule path must reference a resource (/obj/inst/res)");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
+				    uint16_t res_inst_id, uint8_t *data, uint16_t data_len,
+				    bool last_block, size_t total_size, size_t offset)
+{
+	char rule_buf[SEND_SCHED_RULE_STRING_SIZE];
+	char *eq = NULL;
+	const char *attr;
+	const char *value;
+	size_t attr_len;
+	int entry_idx;
+	int current_slot = -1;
+
+	ARG_UNUSED(res_id);
+	ARG_UNUSED(last_block);
+	ARG_UNUSED(total_size);
+	ARG_UNUSED(offset);
+
+	if (!data) {
+		return -EINVAL;
+	}
+
+	if (data_len == 0U) {
+		/* Treat empty payload as clearing the rule instance. */
+		return 0;
+	}
+
+	if (data_len >= sizeof(rule_buf)) {
+		LOG_WRN("Sampling rule string too long (%u)", data_len);
+		return -ENOBUFS;
+	}
+
+	memcpy(rule_buf, data, data_len);
+	rule_buf[data_len] = '\0';
+
+	eq = strchr(rule_buf, '=');
+	if (!eq || strchr(eq + 1, '=')) {
+		LOG_WRN("Sampling rule must be formatted as attribute=value");
+		return -EINVAL;
+	}
+
+	*eq = '\0';
+	attr = rule_buf;
+	value = eq + 1;
+	attr_len = strlen(attr);
+
+	if (attr_len == 0U || *value == '\0') {
+		LOG_WRN("Sampling rule requires both attribute and value");
+		return -EINVAL;
+	}
+
+	for (size_t idx = 0; idx < attr_len; idx++) {
+		if (!islower((unsigned char)attr[idx])) {
+			LOG_WRN("Sampling rule attribute contains invalid characters");
+			return -EINVAL;
+		}
+	}
+
+	if (!send_sched_attribute_is_allowed(attr)) {
+		LOG_WRN("Sampling rule attribute '%s' is not supported", attr);
+		return -EINVAL;
+	}
+
+	if (send_sched_attribute_requires_integer(attr)) {
+		if (!send_sched_is_valid_integer(value)) {
+			LOG_WRN("Sampling rule attribute '%s' expects integer value", attr);
+			return -EINVAL;
+		}
+	} else if (send_sched_attribute_requires_float(attr)) {
+		if (!send_sched_is_valid_float(value)) {
+			LOG_WRN("Sampling rule attribute '%s' expects floating-point value", attr);
+			return -EINVAL;
+		}
+	}
+
+	entry_idx = send_sched_rules_index_for_inst(obj_inst_id);
+	if (entry_idx < 0) {
+		LOG_ERR("Sampling rule instance %u not found", obj_inst_id);
+		return -ENOENT;
+	}
+
+	if (res_inst_id < SEND_SCHED_MAX_RULE_STRINGS) {
+		current_slot = res_inst_id;
+	}
+
+	if (current_slot < 0) {
+		for (int idx = 0; idx < SEND_SCHED_MAX_RULE_STRINGS; idx++) {
+			if (&rule_entries[entry_idx].rules[idx][0] == (char *)data) {
+				current_slot = idx;
+				break;
+			}
+		}
+	}
+
+	if (current_slot < 0 || current_slot >= SEND_SCHED_MAX_RULE_STRINGS) {
+		LOG_ERR("Sampling rule index out of range (%d)", current_slot);
+		return -EINVAL;
+	}
+
+	for (int idx = 0; idx < SEND_SCHED_MAX_RULE_STRINGS; idx++) {
+		const struct lwm2m_engine_res_inst *res_inst;
+		const char *existing_eq;
+
+		if (idx == current_slot) {
+			continue;
+		}
+
+		res_inst = &send_sched_rules_res_inst[entry_idx][idx];
+		if (res_inst->res_inst_id == RES_INSTANCE_NOT_CREATED ||
+		    res_inst->data_len == 0U) {
+			continue;
+		}
+
+		existing_eq = strchr(rule_entries[entry_idx].rules[idx], '=');
+		if (!existing_eq) {
+			continue;
+		}
+
+		if ((size_t)(existing_eq - rule_entries[entry_idx].rules[idx]) == attr_len &&
+		    strncmp(rule_entries[entry_idx].rules[idx], attr, attr_len) == 0) {
+			LOG_WRN("Sampling rule attribute '%s' already defined", attr);
+			return -EEXIST;
+		}
+	}
+
+	return 0;
+}
+
 static struct lwm2m_engine_obj_inst *
 send_sched_rules_create(uint16_t obj_inst_id)
 {
@@ -131,28 +410,44 @@ send_sched_rules_create(uint16_t obj_inst_id)
 	init_res_instance(send_sched_rules_res_inst[avail],
 			  ARRAY_SIZE(send_sched_rules_res_inst[avail]));
 
-	INIT_OBJ_RES_DATA_LEN(SEND_SCHED_RULES_RES_PATH,
-			      send_sched_rules_res[avail],
-			      i,
-			      send_sched_rules_res_inst[avail],
-			      j,
-			      rule_entries[avail].path,
-			      sizeof(rule_entries[avail].path),
-			      0);
+		INIT_OBJ_RES_LEN(SEND_SCHED_RULES_RES_PATH,
+				 send_sched_rules_res[avail],
+				 i,
+				 send_sched_rules_res_inst[avail],
+				 j,
+				 1U,
+				 false,
+				 true,
+				 rule_entries[avail].path,
+				 sizeof(rule_entries[avail].path),
+				 0,
+				 NULL,
+				 NULL,
+				 send_sched_validate_path,
+				 NULL,
+				 NULL);
 
-	INIT_OBJ_RES_MULTI_DATA_LEN(SEND_SCHED_RULES_RES_RULES,
-				    send_sched_rules_res[avail],
-				    i,
-				    send_sched_rules_res_inst[avail],
-				    j,
-				    SEND_SCHED_MAX_RULE_STRINGS,
-				    false,
-				    rule_entries[avail].rules,
-				    sizeof(rule_entries[avail].rules[0]),
-				    0);
+		INIT_OBJ_RES_LEN(SEND_SCHED_RULES_RES_RULES,
+				 send_sched_rules_res[avail],
+				 i,
+				 send_sched_rules_res_inst[avail],
+				 j,
+				 SEND_SCHED_MAX_RULE_STRINGS,
+				 true,
+				 false,
+				 rule_entries[avail].rules,
+				 sizeof(rule_entries[avail].rules[0]),
+				 0,
+				 NULL,
+				 NULL,
+				 send_sched_validate_rule,
+				 NULL,
+				 NULL);
 
 	send_sched_rules_inst[avail].resources = send_sched_rules_res[avail];
 	send_sched_rules_inst[avail].resource_count = i;
+	send_sched_rules_inst[avail].obj = &send_sched_rules_obj;
+	send_sched_rules_inst[avail].obj_inst_id = obj_inst_id;
 
 	return &send_sched_rules_inst[avail];
 }
@@ -185,6 +480,8 @@ int send_scheduler_init(void)
 		lwm2m_register_obj(&send_sched_rules_obj);
 
 		registered = true;
+	} else {
+		LOG_INF("already registered send scheduler objects");
 	}
 
 	ret = lwm2m_create_obj_inst(SEND_SCHED_CTRL_OBJECT_ID, 0, &obj_inst);
@@ -193,12 +490,12 @@ int send_scheduler_init(void)
 		return ret;
 	}
 
-	obj_inst = NULL;
+/*	obj_inst = NULL;
 	ret = lwm2m_create_obj_inst(SEND_SCHED_RULES_OBJECT_ID, 0, &obj_inst);
 	if (ret < 0 && ret != -EEXIST) {
 		LOG_ERR("Failed to instantiate sampling rules object (%d)", ret);
 		return ret;
-	}
+	}*/
 
 	return 0;
 }
