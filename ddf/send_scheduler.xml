@@ -41,6 +41,16 @@
         <Units>seconds</Units>
         <Description>Maximum age in seconds permitted for the oldest buffered sample before a transmission is forced.</Description>
       </Item>
+      <Item ID="3">
+        <Name>flush</Name>
+        <Operations>E</Operations>
+        <MultipleInstances>Single</MultipleInstances>
+        <Mandatory>Optional</Mandatory>
+        <Type></Type>
+        <RangeEnumeration></RangeEnumeration>
+        <Units></Units>
+        <Description>Execute to trigger an immediate data push for all resources covered by active sampling rules.</Description>
+      </Item>
     </Resources>
     <Description2></Description2>
   </Object>

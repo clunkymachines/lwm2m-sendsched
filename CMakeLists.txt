@@ -6,4 +6,5 @@ project(lwm2m_base_client)
 target_sources(app PRIVATE
   src/main.c
   src/send_scheduler.c
+  src/temperature_sensor.c
 )

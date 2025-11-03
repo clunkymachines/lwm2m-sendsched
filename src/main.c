@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "send_scheduler.h"
+#include "temperature_sensor.h"
 LOG_MODULE_REGISTER(lwm2m_base_client, LOG_LEVEL_INF);
 
 #define APP_BANNER "LwM2M base client"
@@ -112,6 +113,11 @@ static int lwm2m_setup(void)
 			  sizeof(usb_ma), 0);
 
 	ret = send_scheduler_init();
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = temperature_sensor_init();
 	if (ret < 0) {
 		return ret;
 	}

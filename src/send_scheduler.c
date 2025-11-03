@@ -16,23 +16,24 @@
 #define LOG_MODULE_NAME send_scheduler
 LOG_MODULE_REGISTER(LOG_MODULE_NAME, LOG_LEVEL_INF);
 
-/* Use a vendor-specific object range for custom objects. */
+/* Use a vendor-specific object range for custom objects */
 #define SEND_SCHED_CTRL_OBJECT_ID 20000
 #define SEND_SCHED_RULES_OBJECT_ID 20001
 
 #define SEND_SCHED_CTRL_RES_PAUSED 0
 #define SEND_SCHED_CTRL_RES_MAX_SAMPLES 1
 #define SEND_SCHED_CTRL_RES_MAX_AGE 2
+#define SEND_SCHED_CTRL_RES_FLUSH 3
 
 #define SEND_SCHED_RULES_RES_PATH 0
 #define SEND_SCHED_RULES_RES_RULES 1
 
-/* Provide a small buffer for rule definitions that the engine can mutate. */
+/* Provide a small buffer for rule definitions that the engine can mutate */
 #define SEND_SCHED_MAX_RULE_STRINGS 4
 #define SEND_SCHED_RULE_STRING_SIZE 64
 #define SEND_SCHED_RULES_MAX_INSTANCES 4
 
-#define SEND_SCHED_CTRL_RES_COUNT 3
+#define SEND_SCHED_CTRL_RES_COUNT 4
 #define SEND_SCHED_CTRL_RES_INST_COUNT SEND_SCHED_CTRL_RES_COUNT
 
 #define SEND_SCHED_RULES_RES_COUNT 2
@@ -41,6 +42,12 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME, LOG_LEVEL_INF);
 struct send_sched_rule_entry {
 	char path[SEND_SCHED_RULE_STRING_SIZE];
 	char rules[SEND_SCHED_MAX_RULE_STRINGS][SEND_SCHED_RULE_STRING_SIZE];
+	struct lwm2m_time_series_elem last_reported;
+	struct lwm2m_obj_path cached_path;
+	double last_observed;
+	bool has_last_reported;
+	bool has_last_observed;
+	bool has_cached_path;
 };
 
 static bool scheduler_paused;
@@ -49,17 +56,242 @@ static int32_t scheduler_max_age;
 
 static struct send_sched_rule_entry rule_entries[SEND_SCHED_RULES_MAX_INSTANCES];
 
+/* Ensure a configured path points at a valid resource */
 static int send_sched_validate_path(uint16_t obj_inst_id, uint16_t res_id,
 				    uint16_t res_inst_id, uint8_t *data, uint16_t data_len,
 				    bool last_block, size_t total_size, size_t offset);
+/* Validate rule syntax and prevent conflicts per instance */
 static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
 				    uint16_t res_inst_id, uint8_t *data, uint16_t data_len,
 				    bool last_block, size_t total_size, size_t offset);
+static int send_sched_flush_cb(uint16_t obj_inst_id, uint8_t *args, uint16_t args_len);
+static int send_sched_collect_paths(struct lwm2m_obj_path *paths, size_t max_paths);
+static int send_sched_parse_path(const char *path, struct lwm2m_obj_path *out);
+static bool send_sched_paths_equal(const struct lwm2m_obj_path *lhs,
+				   const struct lwm2m_obj_path *rhs);
+static int send_sched_find_rule_entry(const struct lwm2m_obj_path *path,
+				      struct lwm2m_obj_path *parsed_path);
+static bool send_sched_rule_parse_double(const char *rule, const char *attr,
+					 double *out_value);
+
+/* Compare two LwM2M paths for equality */
+static bool send_sched_paths_equal(const struct lwm2m_obj_path *lhs,
+				   const struct lwm2m_obj_path *rhs)
+{
+	return lhs->obj_id == rhs->obj_id &&
+	       lhs->obj_inst_id == rhs->obj_inst_id &&
+	       lhs->res_id == rhs->res_id &&
+	       lhs->res_inst_id == rhs->res_inst_id &&
+	       lhs->level == rhs->level;
+}
+
+/* Parse a textual object path into a LwM2M obj path structure */
+static int send_sched_parse_path(const char *path, struct lwm2m_obj_path *out)
+{
+	const char *cursor = path;
+	unsigned long segments[3];
+	char *end = NULL;
+
+	if (!path || path[0] != '/') {
+		return -EINVAL;
+	}
+
+	cursor++;
+
+	for (int idx = 0; idx < ARRAY_SIZE(segments); idx++) {
+		unsigned long value;
+
+		if (*cursor == '\0') {
+			return -EINVAL;
+		}
+
+		errno = 0;
+		value = strtoul(cursor, &end, 10);
+		if (errno == ERANGE || value > UINT16_MAX) {
+			return -ERANGE;
+		}
+
+		if (end == cursor) {
+			return -EINVAL;
+		}
+
+		segments[idx] = value;
+
+		if (idx < (ARRAY_SIZE(segments) - 1)) {
+			if (*end != '/') {
+				return -EINVAL;
+			}
+
+			cursor = end + 1;
+		} else if (*end != '\0') {
+			return -EINVAL;
+		}
+	}
+
+	*out = LWM2M_OBJ((uint16_t)segments[0], (uint16_t)segments[1],
+			 (uint16_t)segments[2]);
+
+	return 0;
+}
+
+/* Gather unique rule paths into the provided array */
+static int send_sched_collect_paths(struct lwm2m_obj_path *paths, size_t max_paths)
+{
+	int count = 0;
+
+	if (!paths || max_paths == 0U) {
+		return 0;
+	}
+
+	for (int idx = 0; idx < SEND_SCHED_RULES_MAX_INSTANCES; idx++) {
+		struct lwm2m_obj_path candidate;
+		bool duplicate = false;
+		int ret;
+
+		if (count >= (int)max_paths) {
+			LOG_WRN("Flush path list full (%zu entries)", max_paths);
+			break;
+		}
+
+		if (rule_entries[idx].path[0] == '\0') {
+			continue;
+		}
+
+		ret = send_sched_parse_path(rule_entries[idx].path, &candidate);
+		if (ret < 0) {
+			LOG_WRN("Skipping invalid rule path '%s' (%d)",
+				rule_entries[idx].path, ret);
+			continue;
+		}
+
+		for (int j = 0; j < count; j++) {
+			if (send_sched_paths_equal(&paths[j], &candidate)) {
+				duplicate = true;
+				break;
+			}
+		}
+
+		if (duplicate) {
+			continue;
+		}
+
+		paths[count++] = candidate;
+	}
+
+	return count;
+}
+
+/* Locate the rule entry matching the given path */
+static int send_sched_find_rule_entry(const struct lwm2m_obj_path *path,
+				      struct lwm2m_obj_path *parsed_path)
+{
+	for (int idx = 0; idx < SEND_SCHED_RULES_MAX_INSTANCES; idx++) {
+		struct lwm2m_obj_path candidate;
+		int ret;
+
+		if (rule_entries[idx].path[0] == '\0') {
+			continue;
+		}
+
+		ret = send_sched_parse_path(rule_entries[idx].path, &candidate);
+		if (ret < 0) {
+			continue;
+		}
+
+		if (send_sched_paths_equal(path, &candidate)) {
+			if (parsed_path) {
+				*parsed_path = candidate;
+			}
+			return idx;
+		}
+	}
+
+	return -ENOENT;
+}
+
+/* Extract a floating-point value from a rule string */
+static bool send_sched_rule_parse_double(const char *rule, const char *attr,
+					 double *out_value)
+{
+	size_t attr_len;
+	char *end = NULL;
+	double value;
+
+	if (!rule || !attr || !out_value) {
+		return false;
+	}
+
+	attr_len = strlen(attr);
+	if (strncmp(rule, attr, attr_len) != 0) {
+		return false;
+	}
+
+	if (rule[attr_len] != '=') {
+		return false;
+	}
+
+	errno = 0;
+	value = strtod(&rule[attr_len + 1], &end);
+	if (errno == ERANGE) {
+		return false;
+	}
+
+	if (end == &rule[attr_len + 1] || (end && *end != '\0')) {
+		return false;
+	}
+
+	*out_value = value;
+
+	return true;
+}
+
+/* Trigger a composite SEND for cached resources */
+static int send_sched_flush_cb(uint16_t obj_inst_id, uint8_t *args, uint16_t args_len)
+{
+	struct lwm2m_ctx *ctx;
+	struct lwm2m_obj_path path_list[SEND_SCHED_RULES_MAX_INSTANCES];
+	int path_count;
+	int ret;
+
+	ARG_UNUSED(obj_inst_id);
+	ARG_UNUSED(args);
+	ARG_UNUSED(args_len);
+
+	ctx = lwm2m_rd_client_ctx();
+	if (!ctx) {
+		LOG_WRN("Cannot flush caches: LwM2M context unavailable");
+		return -ENODEV;
+	}
+
+	path_count = send_sched_collect_paths(path_list, ARRAY_SIZE(path_list));
+	if (path_count <= 0) {
+		LOG_WRN("No cached resources registered for flush");
+		return -ENOENT;
+	}
+
+	if (path_count > CONFIG_LWM2M_COMPOSITE_PATH_LIST_SIZE) {
+		LOG_WRN("Limiting flush to %d path(s)",
+			CONFIG_LWM2M_COMPOSITE_PATH_LIST_SIZE);
+		path_count = CONFIG_LWM2M_COMPOSITE_PATH_LIST_SIZE;
+	}
+
+	ret = lwm2m_send_cb(ctx, path_list, (uint8_t)path_count, NULL);
+	if (ret < 0) {
+		LOG_ERR("Failed to flush cached data (%d)", ret);
+		return ret;
+	}
+
+	LOG_INF("Triggered LwM2M send for %d cached path(s)", path_count);
+
+	return 0;
+}
+
 static struct lwm2m_engine_obj send_sched_ctrl_obj;
 static struct lwm2m_engine_obj_field send_sched_ctrl_fields[] = {
 	OBJ_FIELD(SEND_SCHED_CTRL_RES_PAUSED, RW, BOOL),
 	OBJ_FIELD(SEND_SCHED_CTRL_RES_MAX_SAMPLES, RW, S32),
 	OBJ_FIELD(SEND_SCHED_CTRL_RES_MAX_AGE, RW, S32),
+	OBJ_FIELD_EXECUTE(SEND_SCHED_CTRL_RES_FLUSH),
 };
 static struct lwm2m_engine_res send_sched_ctrl_res[SEND_SCHED_CTRL_RES_COUNT];
 static struct lwm2m_engine_res_inst send_sched_ctrl_res_inst[SEND_SCHED_CTRL_RES_INST_COUNT];
@@ -91,6 +323,8 @@ static struct lwm2m_engine_obj_inst *send_sched_ctrl_create(uint16_t obj_inst_id
 	INIT_OBJ_RES_DATA(SEND_SCHED_CTRL_RES_MAX_AGE, send_sched_ctrl_res, i,
 			  send_sched_ctrl_res_inst, j,
 			  &scheduler_max_age, sizeof(scheduler_max_age));
+	INIT_OBJ_RES_EXECUTE(SEND_SCHED_CTRL_RES_FLUSH, send_sched_ctrl_res, i,
+			     send_sched_flush_cb);
 
 	send_sched_ctrl_inst.resources = send_sched_ctrl_res;
 	send_sched_ctrl_inst.resource_count = i;
@@ -109,6 +343,7 @@ static struct lwm2m_engine_res_inst send_sched_rules_res_inst[SEND_SCHED_RULES_M
 							     [SEND_SCHED_RULES_RES_INST_COUNT];
 static struct lwm2m_engine_obj_inst send_sched_rules_inst[SEND_SCHED_RULES_MAX_INSTANCES];
 
+/* Find the internal rule slot used by an object instance */
 static int send_sched_rules_index_for_inst(uint16_t obj_inst_id)
 {
 	for (int idx = 0; idx < SEND_SCHED_RULES_MAX_INSTANCES; idx++) {
@@ -121,17 +356,20 @@ static int send_sched_rules_index_for_inst(uint16_t obj_inst_id)
 	return -1;
 }
 
+/* Check whether the attribute expects an integer value */
 static bool send_sched_attribute_requires_integer(const char *attr)
 {
 	return (!strcmp(attr, "pmin") || !strcmp(attr, "pmax") ||
 		!strcmp(attr, "epmin") || !strcmp(attr, "epmax"));
 }
 
+/* Check whether the attribute expects a floating-point value */
 static bool send_sched_attribute_requires_float(const char *attr)
 {
 	return (!strcmp(attr, "gt") || !strcmp(attr, "lt") || !strcmp(attr, "st"));
 }
 
+/* Validate that the string can be parsed as a decimal integer */
 static bool send_sched_is_valid_integer(const char *value)
 {
 	char *end = NULL;
@@ -156,6 +394,7 @@ static bool send_sched_is_valid_integer(const char *value)
 	return true;
 }
 
+/* Validate that the string can be parsed as a floating-point number */
 static bool send_sched_is_valid_float(const char *value)
 {
 	char *end = NULL;
@@ -180,12 +419,14 @@ static bool send_sched_is_valid_float(const char *value)
 	return true;
 }
 
+/* Determine whether the attribute is supported by the scheduler */
 static bool send_sched_attribute_is_allowed(const char *attr)
 {
 	return send_sched_attribute_requires_integer(attr) ||
 	       send_sched_attribute_requires_float(attr);
 }
 
+/* Ensure the configured path string references a resource */
 static int send_sched_validate_path(uint16_t obj_inst_id, uint16_t res_id,
 				    uint16_t res_inst_id, uint8_t *data, uint16_t data_len,
 				    bool last_block, size_t total_size, size_t offset)
@@ -251,6 +492,7 @@ static int send_sched_validate_path(uint16_t obj_inst_id, uint16_t res_id,
 	return 0;
 }
 
+/* Check rule syntax and enforce per-instance attribute uniqueness */
 static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
 				    uint16_t res_inst_id, uint8_t *data, uint16_t data_len,
 				    bool last_block, size_t total_size, size_t offset)
@@ -378,6 +620,7 @@ static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
 	return 0;
 }
 
+/* Create a new rules object instance and wire resources */
 static struct lwm2m_engine_obj_inst *
 send_sched_rules_create(uint16_t obj_inst_id)
 {
@@ -447,11 +690,119 @@ send_sched_rules_create(uint16_t obj_inst_id)
 	send_sched_rules_inst[avail].resources = send_sched_rules_res[avail];
 	send_sched_rules_inst[avail].resource_count = i;
 	send_sched_rules_inst[avail].obj = &send_sched_rules_obj;
-	send_sched_rules_inst[avail].obj_inst_id = obj_inst_id;
+send_sched_rules_inst[avail].obj_inst_id = obj_inst_id;
 
 	return &send_sched_rules_inst[avail];
 }
 
+/* Decide whether a sample should be cached for the configured path */
+bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
+				 const struct lwm2m_time_series_elem *element)
+{
+	int entry_idx;
+	struct lwm2m_obj_path entry_path;
+	struct send_sched_rule_entry *entry;
+	bool has_gt = false;
+	bool has_lt = false;
+	bool has_st = false;
+	double gt_value = 0.0;
+	double lt_value = 0.0;
+	double st_value = 0.0;
+	double sample_value;
+	bool trigger = false;
+
+	if (!path || !element) {
+		return true;
+	}
+
+	entry_idx = send_sched_find_rule_entry(path, &entry_path);
+	if (entry_idx < 0) {
+		return true;
+	}
+
+		entry = &rule_entries[entry_idx];
+
+	if (!entry->has_cached_path ||
+	    !send_sched_paths_equal(&entry->cached_path, &entry_path)) {
+		entry->cached_path = entry_path;
+		entry->has_cached_path = true;
+		entry->has_last_reported = false;
+		entry->has_last_observed = false;
+	}
+
+	for (int idx = 0; idx < SEND_SCHED_MAX_RULE_STRINGS; idx++) {
+		const char *rule = entry->rules[idx];
+
+		if (rule[0] == '\0') {
+			continue;
+		}
+
+		if (!has_gt && send_sched_rule_parse_double(rule, "gt", &gt_value)) {
+			has_gt = true;
+			continue;
+		}
+
+		if (!has_lt && send_sched_rule_parse_double(rule, "lt", &lt_value)) {
+			has_lt = true;
+			continue;
+		}
+
+		if (!has_st && send_sched_rule_parse_double(rule, "st", &st_value)) {
+			has_st = true;
+			continue;
+		}
+	}
+
+	if (!has_gt && !has_lt && !has_st) {
+		return true;
+	}
+
+	sample_value = element->f;
+
+	if (has_gt && sample_value > gt_value) {
+		if (!entry->has_last_observed ||
+		    entry->last_observed <= gt_value) {
+			trigger = true;
+		}
+	}
+
+	if (has_lt && sample_value < lt_value) {
+		if (!entry->has_last_observed ||
+		    entry->last_observed >= lt_value) {
+			trigger = true;
+		}
+	}
+
+	if (has_st) {
+		if (!entry->has_last_reported) {
+			trigger = true;
+		} else {
+			double delta = sample_value - entry->last_reported.f;
+
+			if (delta < 0.0) {
+				delta = -delta;
+			}
+
+			if (delta >= st_value) {
+				trigger = true;
+			}
+		}
+	}
+
+	entry->last_observed = sample_value;
+	entry->has_last_observed = true;
+
+	if (!trigger) {
+		return false;
+	}
+
+	entry->last_reported = *element;
+	entry->has_last_reported = true;
+
+	return true;
+}
+
+/* Register the scheduler objects and instantiate defaults */
 int send_scheduler_init(void)
 {
 	static bool registered;
