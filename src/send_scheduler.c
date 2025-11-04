@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -32,6 +33,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME, LOG_LEVEL_INF);
 #define SEND_SCHED_MAX_RULE_STRINGS 4
 #define SEND_SCHED_RULE_STRING_SIZE 64
 #define SEND_SCHED_RULES_MAX_INSTANCES 4
+#define SEND_SCHED_VALUE_STR_SIZE 16
 
 #define SEND_SCHED_CTRL_RES_COUNT 4
 #define SEND_SCHED_CTRL_RES_INST_COUNT SEND_SCHED_CTRL_RES_COUNT
@@ -73,6 +75,10 @@ static int send_sched_find_rule_entry(const struct lwm2m_obj_path *path,
 				      struct lwm2m_obj_path *parsed_path);
 static bool send_sched_rule_parse_double(const char *rule, const char *attr,
 					 double *out_value);
+static int send_sched_rules_delete(uint16_t obj_inst_id);
+static void send_sched_format_value(double value, char *buf, size_t buf_len);
+static void send_sched_log_decision(const char *verb, const char *path_str,
+				    double sample, const char *reason);
 
 /* Compare two LwM2M paths for equality */
 static bool send_sched_paths_equal(const struct lwm2m_obj_path *lhs,
@@ -504,18 +510,48 @@ static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
 	size_t attr_len;
 	int entry_idx;
 	int current_slot = -1;
+	struct send_sched_rule_entry *entry;
 
 	ARG_UNUSED(res_id);
 	ARG_UNUSED(last_block);
 	ARG_UNUSED(total_size);
 	ARG_UNUSED(offset);
 
+	entry_idx = send_sched_rules_index_for_inst(obj_inst_id);
+	if (entry_idx < 0) {
+		LOG_ERR("Sampling rule instance %u not found", obj_inst_id);
+		return -ENOENT;
+	}
+
+	entry = &rule_entries[entry_idx];
+
+	if (res_inst_id < SEND_SCHED_MAX_RULE_STRINGS) {
+		current_slot = res_inst_id;
+	}
+
+	if (current_slot < 0) {
+		for (int idx = 0; idx < SEND_SCHED_MAX_RULE_STRINGS; idx++) {
+			if (&entry->rules[idx][0] == (char *)data) {
+				current_slot = idx;
+				break;
+			}
+		}
+	}
+
+	if (current_slot < 0 || current_slot >= SEND_SCHED_MAX_RULE_STRINGS) {
+		LOG_ERR("Sampling rule index out of range (%d)", current_slot);
+		return -EINVAL;
+	}
+
 	if (!data) {
 		return -EINVAL;
 	}
 
 	if (data_len == 0U) {
-		/* Treat empty payload as clearing the rule instance. */
+		entry->rules[current_slot][0] = '\0';
+		send_sched_rules_res_inst[entry_idx][current_slot].data_len = 0U;
+		entry->has_last_reported = false;
+		entry->has_last_observed = false;
 		return 0;
 	}
 
@@ -567,30 +603,6 @@ static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
 		}
 	}
 
-	entry_idx = send_sched_rules_index_for_inst(obj_inst_id);
-	if (entry_idx < 0) {
-		LOG_ERR("Sampling rule instance %u not found", obj_inst_id);
-		return -ENOENT;
-	}
-
-	if (res_inst_id < SEND_SCHED_MAX_RULE_STRINGS) {
-		current_slot = res_inst_id;
-	}
-
-	if (current_slot < 0) {
-		for (int idx = 0; idx < SEND_SCHED_MAX_RULE_STRINGS; idx++) {
-			if (&rule_entries[entry_idx].rules[idx][0] == (char *)data) {
-				current_slot = idx;
-				break;
-			}
-		}
-	}
-
-	if (current_slot < 0 || current_slot >= SEND_SCHED_MAX_RULE_STRINGS) {
-		LOG_ERR("Sampling rule index out of range (%d)", current_slot);
-		return -EINVAL;
-	}
-
 	for (int idx = 0; idx < SEND_SCHED_MAX_RULE_STRINGS; idx++) {
 		const struct lwm2m_engine_res_inst *res_inst;
 		const char *existing_eq;
@@ -605,13 +617,13 @@ static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
 			continue;
 		}
 
-		existing_eq = strchr(rule_entries[entry_idx].rules[idx], '=');
+		existing_eq = strchr(entry->rules[idx], '=');
 		if (!existing_eq) {
 			continue;
 		}
 
-		if ((size_t)(existing_eq - rule_entries[entry_idx].rules[idx]) == attr_len &&
-		    strncmp(rule_entries[entry_idx].rules[idx], attr, attr_len) == 0) {
+		if ((size_t)(existing_eq - entry->rules[idx]) == attr_len &&
+		    strncmp(entry->rules[idx], attr, attr_len) == 0) {
 			LOG_WRN("Sampling rule attribute '%s' already defined", attr);
 			return -EEXIST;
 		}
@@ -695,6 +707,63 @@ send_sched_rules_inst[avail].obj_inst_id = obj_inst_id;
 	return &send_sched_rules_inst[avail];
 }
 
+/* Reset rule bookkeeping when the instance is deleted */
+static int send_sched_rules_delete(uint16_t obj_inst_id)
+{
+	int idx = send_sched_rules_index_for_inst(obj_inst_id);
+
+	if (idx < 0) {
+		return -ENOENT;
+	}
+
+	memset(&rule_entries[idx], 0, sizeof(rule_entries[idx]));
+	memset(&send_sched_rules_res[idx], 0, sizeof(send_sched_rules_res[idx]));
+	memset(&send_sched_rules_inst[idx], 0, sizeof(send_sched_rules_inst[idx]));
+	init_res_instance(send_sched_rules_res_inst[idx],
+			  ARRAY_SIZE(send_sched_rules_res_inst[idx]));
+
+	return 0;
+}
+
+/* Render a floating-point sample as "x.xxx" without relying on float printf */
+static void send_sched_format_value(double value, char *buf, size_t buf_len)
+{
+	int32_t whole = (int32_t)value;
+	double remainder = value - (double)whole;
+	int32_t frac;
+
+	if (remainder < 0.0) {
+		remainder = -remainder;
+	}
+
+	frac = (int32_t)((remainder * 1000.0) + 0.5);
+
+	if (frac >= 1000) {
+		frac -= 1000;
+		if (value >= 0.0) {
+			whole += 1;
+		} else {
+			whole -= 1;
+		}
+	}
+
+	if (whole == 0 && value < 0.0) {
+		snprintk(buf, buf_len, "-0.%03d", frac);
+	} else {
+		snprintk(buf, buf_len, "%d.%03d", whole, frac);
+	}
+}
+
+/* Emit a standardized log line describing the cache decision */
+static void send_sched_log_decision(const char *verb, const char *path_str,
+				    double sample, const char *reason)
+{
+	char sample_buf[SEND_SCHED_VALUE_STR_SIZE];
+
+	send_sched_format_value(sample, sample_buf, sizeof(sample_buf));
+	LOG_INF("%s %s sample %s: %s", verb, path_str, sample_buf, reason);
+}
+
 /* Decide whether a sample should be cached for the configured path */
 bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 				 const struct lwm2m_time_series_elem *element)
@@ -710,17 +779,33 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	double st_value = 0.0;
 	double sample_value;
 	bool trigger = false;
+	char path_buf[LWM2M_MAX_PATH_STR_SIZE];
+	struct lwm2m_obj_path path_copy;
+	const char *path_str = "unknown";
+	char keep_reason[96] = {0};
+	char drop_reason[96] = {0};
+	bool drop_reason_set = false;
+	char sample_str[SEND_SCHED_VALUE_STR_SIZE];
+	char prev_str[SEND_SCHED_VALUE_STR_SIZE];
+	char rule_str[SEND_SCHED_VALUE_STR_SIZE];
 
 	if (!path || !element) {
 		return true;
 	}
 
+	path_copy = *path;
+	path_str = lwm2m_path_log_buf(path_buf, &path_copy);
+	sample_value = element->f;
+
 	entry_idx = send_sched_find_rule_entry(path, &entry_path);
 	if (entry_idx < 0) {
-		return true;
+		send_sched_format_value(sample_value, sample_str, sizeof(sample_str));
+		send_sched_log_decision("Drop", path_str, sample_value,
+					"no rule entry");
+		return false;
 	}
 
-		entry = &rule_entries[entry_idx];
+	entry = &rule_entries[entry_idx];
 
 	if (!entry->has_cached_path ||
 	    !send_sched_paths_equal(&entry->cached_path, &entry_path)) {
@@ -754,28 +839,55 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	}
 
 	if (!has_gt && !has_lt && !has_st) {
+		send_sched_log_decision("Keep", path_str, sample_value,
+					"no threshold rules configured");
 		return true;
 	}
 
-	sample_value = element->f;
+	if (has_gt) {
+		double prev = entry->has_last_observed ? entry->last_observed : sample_value;
+		send_sched_format_value(prev, prev_str, sizeof(prev_str));
+		send_sched_format_value(gt_value, rule_str, sizeof(rule_str));
 
-	if (has_gt && sample_value > gt_value) {
-		if (!entry->has_last_observed ||
-		    entry->last_observed <= gt_value) {
-			trigger = true;
+		if (sample_value > gt_value) {
+			if (!entry->has_last_observed || entry->last_observed <= gt_value) {
+				trigger = true;
+				snprintk(keep_reason, sizeof(keep_reason),
+					 "crossed gt %s (prev %s)", rule_str, prev_str);
+			} else {
+				snprintk(drop_reason, sizeof(drop_reason),
+					 "above gt %s but prev %s also above",
+					 rule_str, prev_str);
+				drop_reason_set = true;
+			}
 		}
 	}
 
-	if (has_lt && sample_value < lt_value) {
-		if (!entry->has_last_observed ||
-		    entry->last_observed >= lt_value) {
-			trigger = true;
+	if (!trigger && has_lt) {
+		double prev = entry->has_last_observed ? entry->last_observed : sample_value;
+		send_sched_format_value(prev, prev_str, sizeof(prev_str));
+		send_sched_format_value(lt_value, rule_str, sizeof(rule_str));
+
+		if (sample_value < lt_value) {
+			if (!entry->has_last_observed || entry->last_observed >= lt_value) {
+				trigger = true;
+				snprintk(keep_reason, sizeof(keep_reason),
+					 "crossed lt %s (prev %s)", rule_str, prev_str);
+			} else if (!drop_reason_set) {
+				snprintk(drop_reason, sizeof(drop_reason),
+					 "below lt %s but prev %s also below",
+					 rule_str, prev_str);
+				drop_reason_set = true;
+			}
 		}
 	}
 
-	if (has_st) {
+	if (!trigger && has_st) {
 		if (!entry->has_last_reported) {
 			trigger = true;
+			send_sched_format_value(st_value, rule_str, sizeof(rule_str));
+			snprintk(keep_reason, sizeof(keep_reason),
+				 "no prior sample, st %s", rule_str);
 		} else {
 			double delta = sample_value - entry->last_reported.f;
 
@@ -785,6 +897,16 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 
 			if (delta >= st_value) {
 				trigger = true;
+				send_sched_format_value(delta, sample_str, sizeof(sample_str));
+				send_sched_format_value(st_value, rule_str, sizeof(rule_str));
+				snprintk(keep_reason, sizeof(keep_reason),
+					 "delta %s >= st %s", sample_str, rule_str);
+			} else if (!drop_reason_set) {
+				send_sched_format_value(delta, sample_str, sizeof(sample_str));
+				send_sched_format_value(st_value, rule_str, sizeof(rule_str));
+				snprintk(drop_reason, sizeof(drop_reason),
+					 "delta %s < st %s", sample_str, rule_str);
+				drop_reason_set = true;
 			}
 		}
 	}
@@ -793,11 +915,21 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	entry->has_last_observed = true;
 
 	if (!trigger) {
+		if (!drop_reason_set) {
+			snprintk(drop_reason, sizeof(drop_reason), "no rule triggered");
+		}
+		send_sched_log_decision("Drop", path_str, sample_value, drop_reason);
 		return false;
 	}
 
 	entry->last_reported = *element;
 	entry->has_last_reported = true;
+
+	if (keep_reason[0] == '\0') {
+		snprintk(keep_reason, sizeof(keep_reason), "rule triggered");
+	}
+
+	send_sched_log_decision("Keep", path_str, sample_value, keep_reason);
 
 	return true;
 }
@@ -828,6 +960,7 @@ int send_scheduler_init(void)
 		send_sched_rules_obj.field_count = ARRAY_SIZE(send_sched_rules_fields);
 		send_sched_rules_obj.max_instance_count = SEND_SCHED_RULES_MAX_INSTANCES;
 		send_sched_rules_obj.create_cb = send_sched_rules_create;
+		send_sched_rules_obj.delete_cb = send_sched_rules_delete;
 		lwm2m_register_obj(&send_sched_rules_obj);
 
 		registered = true;
