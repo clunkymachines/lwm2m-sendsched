@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <math.h>
 #include <stdbool.h>
+#include <zephyr/kernel.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -34,6 +35,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME, LOG_LEVEL_INF);
 #define SEND_SCHED_RULE_STRING_SIZE 64
 #define SEND_SCHED_RULES_MAX_INSTANCES 4
 #define SEND_SCHED_VALUE_STR_SIZE 16
+#define SEND_SCHED_MSEC_PER_SEC 1000LL
 
 #define SEND_SCHED_CTRL_RES_COUNT 4
 #define SEND_SCHED_CTRL_RES_INST_COUNT SEND_SCHED_CTRL_RES_COUNT
@@ -47,9 +49,13 @@ struct send_sched_rule_entry {
 	struct lwm2m_time_series_elem last_reported;
 	struct lwm2m_obj_path cached_path;
 	double last_observed;
+	int64_t last_accept_ms;
+	int64_t pmin_deadline_ms;
 	bool has_last_reported;
 	bool has_last_observed;
 	bool has_cached_path;
+	bool has_last_accept_ms;
+	bool pmin_waiting;
 };
 
 static bool scheduler_paused;
@@ -79,6 +85,8 @@ static int send_sched_rules_delete(uint16_t obj_inst_id);
 static void send_sched_format_value(double value, char *buf, size_t buf_len);
 static void send_sched_log_decision(const char *verb, const char *path_str,
 				    double sample, const char *reason);
+static bool send_sched_rule_parse_int(const char *rule, const char *attr,
+				      int32_t *out_value);
 
 /* Compare two LwM2M paths for equality */
 static bool send_sched_paths_equal(const struct lwm2m_obj_path *lhs,
@@ -247,6 +255,42 @@ static bool send_sched_rule_parse_double(const char *rule, const char *attr,
 	}
 
 	*out_value = value;
+
+	return true;
+}
+
+/* Extract an integer value from a rule string */
+static bool send_sched_rule_parse_int(const char *rule, const char *attr,
+				      int32_t *out_value)
+{
+	size_t attr_len;
+	char *end = NULL;
+	long value;
+
+	if (!rule || !attr || !out_value) {
+		return false;
+	}
+
+	attr_len = strlen(attr);
+	if (strncmp(rule, attr, attr_len) != 0) {
+		return false;
+	}
+
+	if (rule[attr_len] != '=') {
+		return false;
+	}
+
+	errno = 0;
+	value = strtol(&rule[attr_len + 1], &end, 10);
+	if (errno == ERANGE || value < INT32_MIN || value > INT32_MAX) {
+		return false;
+	}
+
+	if (end == &rule[attr_len + 1] || (end && *end != '\0')) {
+		return false;
+	}
+
+	*out_value = (int32_t)value;
 
 	return true;
 }
@@ -548,6 +592,17 @@ static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
 	}
 
 	if (data_len == 0U) {
+		const char *existing = entry->rules[current_slot];
+
+		if (existing[0] != '\0') {
+			int32_t tmp;
+
+			if (send_sched_rule_parse_int(existing, "pmin", &tmp)) {
+				entry->pmin_waiting = false;
+				entry->pmin_deadline_ms = 0;
+			}
+		}
+
 		entry->rules[current_slot][0] = '\0';
 		send_sched_rules_res_inst[entry_idx][current_slot].data_len = 0U;
 		entry->has_last_reported = false;
@@ -779,6 +834,7 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	double st_value = 0.0;
 	double sample_value;
 	bool trigger = false;
+	bool trigger_due_to_pmin_expiry = false;
 	char path_buf[LWM2M_MAX_PATH_STR_SIZE];
 	struct lwm2m_obj_path path_copy;
 	const char *path_str = "unknown";
@@ -788,6 +844,9 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	char sample_str[SEND_SCHED_VALUE_STR_SIZE];
 	char prev_str[SEND_SCHED_VALUE_STR_SIZE];
 	char rule_str[SEND_SCHED_VALUE_STR_SIZE];
+	bool has_pmin = false;
+	int32_t pmin_seconds = 0;
+	int64_t now_ms;
 
 	if (!path || !element) {
 		return true;
@@ -796,10 +855,10 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	path_copy = *path;
 	path_str = lwm2m_path_log_buf(path_buf, &path_copy);
 	sample_value = element->f;
+	now_ms = k_uptime_get();
 
 	entry_idx = send_sched_find_rule_entry(path, &entry_path);
 	if (entry_idx < 0) {
-		send_sched_format_value(sample_value, sample_str, sizeof(sample_str));
 		send_sched_log_decision("Drop", path_str, sample_value,
 					"no rule entry");
 		return false;
@@ -836,12 +895,34 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 			has_st = true;
 			continue;
 		}
+
+		if (!has_pmin && send_sched_rule_parse_int(rule, "pmin", &pmin_seconds)) {
+			if (pmin_seconds < 0) {
+				pmin_seconds = 0;
+			}
+			has_pmin = true;
+			continue;
+		}
+	}
+
+	if (!has_pmin) {
+		entry->pmin_waiting = false;
+		entry->pmin_deadline_ms = 0;
+	}
+
+	if (has_pmin && entry->pmin_waiting &&
+	    now_ms >= entry->pmin_deadline_ms) {
+		trigger = true;
+		trigger_due_to_pmin_expiry = true;
+		entry->pmin_waiting = false;
+		snprintk(keep_reason, sizeof(keep_reason),
+			 "pmin %d expired", pmin_seconds);
 	}
 
 	if (!has_gt && !has_lt && !has_st) {
-		send_sched_log_decision("Keep", path_str, sample_value,
-					"no threshold rules configured");
-		return true;
+		trigger = true;
+		snprintk(keep_reason, sizeof(keep_reason),
+			 "no threshold rules configured");
 	}
 
 	if (has_gt) {
@@ -922,8 +1003,37 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 		return false;
 	}
 
+	if (has_pmin && pmin_seconds > 0 && entry->has_last_accept_ms &&
+	    !trigger_due_to_pmin_expiry) {
+		int64_t required_ms = (int64_t)pmin_seconds * SEND_SCHED_MSEC_PER_SEC;
+		int64_t elapsed_ms = now_ms - entry->last_accept_ms;
+
+		if (elapsed_ms < required_ms) {
+			int64_t remaining_ms = required_ms - elapsed_ms;
+
+			entry->pmin_waiting = true;
+			entry->pmin_deadline_ms = entry->last_accept_ms + required_ms;
+
+			snprintk(drop_reason, sizeof(drop_reason),
+				 "pmin %d active (%lld ms remaining)",
+				 pmin_seconds, (long long)remaining_ms);
+			send_sched_log_decision("Defer", path_str, sample_value, drop_reason);
+			return false;
+		}
+	}
+
 	entry->last_reported = *element;
 	entry->has_last_reported = true;
+	entry->last_accept_ms = now_ms;
+	entry->has_last_accept_ms = true;
+
+	if (has_pmin && pmin_seconds > 0) {
+		entry->pmin_deadline_ms = entry->last_accept_ms +
+			((int64_t)pmin_seconds * SEND_SCHED_MSEC_PER_SEC);
+		entry->pmin_waiting = false;
+	} else if (!has_pmin) {
+		entry->pmin_waiting = false;
+	}
 
 	if (keep_reason[0] == '\0') {
 		snprintk(keep_reason, sizeof(keep_reason), "rule triggered");
