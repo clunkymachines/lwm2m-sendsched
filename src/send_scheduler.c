@@ -24,11 +24,11 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME, LOG_LEVEL_INF);
 #define SEND_SCHED_CTRL_OBJECT_ID 20000
 #define SEND_SCHED_RULES_OBJECT_ID 20001
 
+/* resource IDs*/
 #define SEND_SCHED_CTRL_RES_PAUSED 0
 #define SEND_SCHED_CTRL_RES_MAX_SAMPLES 1
 #define SEND_SCHED_CTRL_RES_MAX_AGE 2
 #define SEND_SCHED_CTRL_RES_FLUSH 3
-
 #define SEND_SCHED_RULES_RES_PATH 0
 #define SEND_SCHED_RULES_RES_RULES 1
 
@@ -36,8 +36,6 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME, LOG_LEVEL_INF);
 #define SEND_SCHED_MAX_RULE_STRINGS 4
 #define SEND_SCHED_RULE_STRING_SIZE 64
 #define SEND_SCHED_RULES_MAX_INSTANCES 4
-#define SEND_SCHED_VALUE_STR_SIZE 16
-#define SEND_SCHED_MSEC_PER_SEC 1000LL
 
 #define SEND_SCHED_CTRL_RES_COUNT 4
 #define SEND_SCHED_CTRL_RES_INST_COUNT SEND_SCHED_CTRL_RES_COUNT
@@ -45,31 +43,31 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME, LOG_LEVEL_INF);
 #define SEND_SCHED_RULES_RES_COUNT 2
 #define SEND_SCHED_RULES_RES_INST_COUNT (1 + SEND_SCHED_MAX_RULE_STRINGS)
 
+/* Aggregated bookkeeping for one scheduler rule instance */
 struct send_sched_rule_entry {
-	char path[SEND_SCHED_RULE_STRING_SIZE];
-	char rules[SEND_SCHED_MAX_RULE_STRINGS][SEND_SCHED_RULE_STRING_SIZE];
-	struct lwm2m_time_series_elem last_reported;
-	struct lwm2m_obj_path cached_path;
-	double last_observed;
-	int64_t last_accept_ms;
-	int64_t pmin_deadline_ms;
-	int64_t pmax_deadline_ms;
-	bool has_last_reported;
-	bool has_last_observed;
-	bool has_cached_path;
-	bool has_last_accept_ms;
-	bool pmin_waiting;
-	bool has_pmin;
-	bool has_pmax;
-	int32_t pmin_seconds;
-	int32_t pmax_seconds;
-	struct k_work_delayable pmax_work;
-	bool pmax_timer_active;
+	char path[SEND_SCHED_RULE_STRING_SIZE];          /* LwM2M-visible path string (/obj/inst/res) */
+	struct lwm2m_obj_path cached_path;               /* Parsed path for fast comparisons and cache lookups */
+	bool has_cached_path;                            /* Guard for cached_path validity */
+	char rules[SEND_SCHED_MAX_RULE_STRINGS][SEND_SCHED_RULE_STRING_SIZE]; /* Raw rule strings (gt/lt/st/pmin/pmax) */
+	double last_observed;                            /* Most recent sample seen, even if it was dropped */
+	bool has_last_observed;                          /* Guard for last_observed validity */
+	struct lwm2m_time_series_elem last_reported;     /* Last sample committed to the cache */
+	bool has_last_reported;                          /* Guard for last_reported validity */
+	int64_t last_accept_ms;                          /* Monotonic timestamp (ms) of last accepted sample */
+	bool has_last_accept_ms;                         /* Guard for last_accept_ms */
+	int64_t pmin_deadline_ms;                        /* Next time pmin allows a sample */
+	bool pmin_waiting;                               /* True when we’re deferring because of pmin */
+	bool has_pmin;                                   /* pmin is configured (>0) */
+	int32_t pmin_seconds;                            /* Cached pmin seconds value */
+	int64_t pmax_deadline_ms;                        /* Next time pmax requires a cached refresh */
+	int32_t pmax_seconds;                            /* Cached pmax seconds value */
+	struct k_work_delayable pmax_work;               /* Work item used to enforce pmax */
+	bool pmax_timer_active;                          /* True if the pmax timer is currently scheduled */
 };
 
-static bool scheduler_paused;
-static int32_t scheduler_max_samples;
-static int32_t scheduler_max_age;
+static bool scheduler_paused;       /* Reflects /20000/0/0 (pause flag) */
+static int32_t scheduler_max_samples; /* Placeholder for /20000/0/1, currently unused */
+static int32_t scheduler_max_age;     /* Placeholder for /20000/0/2, currently unused */
 
 static struct send_sched_rule_entry rule_entries[SEND_SCHED_RULES_MAX_INSTANCES];
 
@@ -91,9 +89,8 @@ static int send_sched_find_rule_entry(const struct lwm2m_obj_path *path,
 static bool send_sched_rule_parse_double(const char *rule, const char *attr,
 					 double *out_value);
 static int send_sched_rules_delete(uint16_t obj_inst_id);
-static void send_sched_format_value(double value, char *buf, size_t buf_len);
-static void send_sched_log_decision(const char *verb, const char *path_str,
-				    double sample, const char *reason);
+#define send_sched_log_decision(verb, path_str, sample, reason) \
+	LOG_DBG("%s %s sample %.3f: %s", verb, path_str, sample, reason)
 static bool send_sched_rule_parse_int(const char *rule, const char *attr,
 				      int32_t *out_value);
 static void send_sched_cancel_pmax_timer(struct send_sched_rule_entry *entry);
@@ -327,7 +324,7 @@ static void send_sched_arm_pmax_timer(struct send_sched_rule_entry *entry)
 		return;
 	}
 
-	if (!entry->has_pmax || entry->pmax_seconds <= 0) {
+	if (entry->pmax_seconds <= 0) {
 		send_sched_cancel_pmax_timer(entry);
 		return;
 	}
@@ -336,7 +333,7 @@ static void send_sched_arm_pmax_timer(struct send_sched_rule_entry *entry)
 
 	int64_t now_ms = k_uptime_get();
 	int64_t deadline_ms = entry->pmax_deadline_ms;
-	int64_t required_ms = (int64_t)entry->pmax_seconds * SEND_SCHED_MSEC_PER_SEC;
+	int64_t required_ms = (int64_t)entry->pmax_seconds * 1000LL;
 
 	if (deadline_ms <= 0) {
 		deadline_ms = now_ms + required_ms;
@@ -444,6 +441,13 @@ static struct lwm2m_engine_obj_inst *send_sched_ctrl_create(uint16_t obj_inst_id
 	send_sched_ctrl_inst.resource_count = i;
 
 	return &send_sched_ctrl_inst;
+}
+
+static int send_sched_ctrl_delete(uint16_t obj_inst_id)
+{
+	ARG_UNUSED(obj_inst_id);
+	LOG_WRN("Scheduler control object cannot be deleted");
+	return -EBUSY;
 }
 
 static struct lwm2m_engine_obj send_sched_rules_obj;
@@ -677,7 +681,6 @@ static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
 			}
 
 			if (send_sched_rule_parse_int(existing, "pmax", &tmp)) {
-				entry->has_pmax = false;
 				entry->pmax_seconds = 0;
 				entry->pmax_deadline_ms = 0;
 				send_sched_cancel_pmax_timer(entry);
@@ -869,45 +872,6 @@ static int send_sched_rules_delete(uint16_t obj_inst_id)
 	return 0;
 }
 
-/* Render a floating-point sample as "x.xxx" without relying on float printf */
-static void send_sched_format_value(double value, char *buf, size_t buf_len)
-{
-	int32_t whole = (int32_t)value;
-	double remainder = value - (double)whole;
-	int32_t frac;
-
-	if (remainder < 0.0) {
-		remainder = -remainder;
-	}
-
-	frac = (int32_t)((remainder * 1000.0) + 0.5);
-
-	if (frac >= 1000) {
-		frac -= 1000;
-		if (value >= 0.0) {
-			whole += 1;
-		} else {
-			whole -= 1;
-		}
-	}
-
-	if (whole == 0 && value < 0.0) {
-		snprintk(buf, buf_len, "-0.%03d", frac);
-	} else {
-		snprintk(buf, buf_len, "%d.%03d", whole, frac);
-	}
-}
-
-/* Emit a standardized log line describing the cache decision */
-static void send_sched_log_decision(const char *verb, const char *path_str,
-				    double sample, const char *reason)
-{
-	char sample_buf[SEND_SCHED_VALUE_STR_SIZE];
-
-	send_sched_format_value(sample, sample_buf, sizeof(sample_buf));
-	LOG_INF("%s %s sample %s: %s", verb, path_str, sample_buf, reason);
-}
-
 /* Work handler that forces a SEND when pmax expires */
 static void send_sched_pmax_work_handler(struct k_work *work)
 {
@@ -965,7 +929,7 @@ static void send_sched_pmax_work_handler(struct k_work *work)
 			send_sched_log_decision("Cache", path_str, elem.f, reason);
 		}
 	} else {
-		LOG_INF("pmax timer fired for %s before any sample cached", entry->path);
+		LOG_DBG("pmax timer fired for %s before any sample cached", entry->path);
 	}
 
 	entry->last_accept_ms = now_ms;
@@ -973,16 +937,16 @@ static void send_sched_pmax_work_handler(struct k_work *work)
 
 	if (entry->has_pmin && entry->pmin_seconds > 0) {
 		entry->pmin_deadline_ms = now_ms +
-			((int64_t)entry->pmin_seconds * SEND_SCHED_MSEC_PER_SEC);
+			((int64_t)entry->pmin_seconds * 1000LL);
 		entry->pmin_waiting = false;
 	} else {
 		entry->pmin_waiting = false;
 		entry->pmin_deadline_ms = 0;
 	}
 
-	if (entry->has_pmax && entry->pmax_seconds > 0) {
+	if (entry->pmax_seconds > 0) {
 		entry->pmax_deadline_ms = now_ms +
-			((int64_t)entry->pmax_seconds * SEND_SCHED_MSEC_PER_SEC);
+			((int64_t)entry->pmax_seconds * 1000LL);
 		send_sched_arm_pmax_timer(entry);
 	} else {
 		entry->pmax_deadline_ms = 0;
@@ -1013,9 +977,6 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	char keep_reason[96] = {0};
 	char drop_reason[96] = {0};
 	bool drop_reason_set = false;
-	char sample_str[SEND_SCHED_VALUE_STR_SIZE];
-	char prev_str[SEND_SCHED_VALUE_STR_SIZE];
-	char rule_str[SEND_SCHED_VALUE_STR_SIZE];
 	int32_t pmin_seconds = 0;
 	int32_t pmax_seconds = 0;
 	int64_t now_ms;
@@ -1028,6 +989,12 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	path_str = lwm2m_path_log_buf(path_buf, &path_copy);
 	sample_value = element->f;
 	now_ms = k_uptime_get();
+
+	if (scheduler_paused) {
+		send_sched_log_decision("Drop", path_str, sample_value,
+					"scheduler paused");
+		return false;
+	}
 
 	entry_idx = send_sched_find_rule_entry(path, &entry_path);
 	if (entry_idx < 0) {
@@ -1091,8 +1058,8 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	int64_t pmax_required_ms = 0;
 
 	if (effective_has_pmin) {
-		pmin_required_ms = (int64_t)pmin_seconds * SEND_SCHED_MSEC_PER_SEC;
-	}
+		pmin_required_ms = (int64_t)pmin_seconds * 1000LL;
+}
 
 	if (effective_has_pmax && effective_has_pmin && pmax_seconds <= pmin_seconds) {
 		LOG_WRN("Ignoring pmax <= pmin for path %s", entry->path);
@@ -1106,10 +1073,9 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 		entry->pmin_deadline_ms = 0;
 	}
 
-	entry->has_pmax = effective_has_pmax;
 	entry->pmax_seconds = effective_has_pmax ? pmax_seconds : 0;
 	if (effective_has_pmax) {
-		pmax_required_ms = (int64_t)pmax_seconds * SEND_SCHED_MSEC_PER_SEC;
+		pmax_required_ms = (int64_t)pmax_seconds * 1000LL;
 		if (entry->has_last_accept_ms) {
 			entry->pmax_deadline_ms = entry->last_accept_ms + pmax_required_ms;
 		} else if (entry->pmax_deadline_ms == 0) {
@@ -1147,18 +1113,16 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 
 	if (has_gt) {
 		double prev = entry->has_last_observed ? entry->last_observed : sample_value;
-		send_sched_format_value(prev, prev_str, sizeof(prev_str));
-		send_sched_format_value(gt_value, rule_str, sizeof(rule_str));
 
 		if (sample_value > gt_value) {
 			if (!entry->has_last_observed || entry->last_observed <= gt_value) {
 				trigger = true;
 				snprintk(keep_reason, sizeof(keep_reason),
-					 "crossed gt %s (prev %s)", rule_str, prev_str);
+					 "crossed gt %.3f (prev %.3f)", gt_value, prev);
 			} else {
 				snprintk(drop_reason, sizeof(drop_reason),
-					 "above gt %s but prev %s also above",
-					 rule_str, prev_str);
+					 "above gt %.3f but prev %.3f also above",
+					 gt_value, prev);
 				drop_reason_set = true;
 			}
 		}
@@ -1166,18 +1130,16 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 
 	if (!trigger && has_lt) {
 		double prev = entry->has_last_observed ? entry->last_observed : sample_value;
-		send_sched_format_value(prev, prev_str, sizeof(prev_str));
-		send_sched_format_value(lt_value, rule_str, sizeof(rule_str));
 
 		if (sample_value < lt_value) {
 			if (!entry->has_last_observed || entry->last_observed >= lt_value) {
 				trigger = true;
 				snprintk(keep_reason, sizeof(keep_reason),
-					 "crossed lt %s (prev %s)", rule_str, prev_str);
+					 "crossed lt %.3f (prev %.3f)", lt_value, prev);
 			} else if (!drop_reason_set) {
 				snprintk(drop_reason, sizeof(drop_reason),
-					 "below lt %s but prev %s also below",
-					 rule_str, prev_str);
+					 "below lt %.3f but prev %.3f also below",
+					 lt_value, prev);
 				drop_reason_set = true;
 			}
 		}
@@ -1186,9 +1148,8 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	if (!trigger && has_st) {
 		if (!entry->has_last_reported) {
 			trigger = true;
-			send_sched_format_value(st_value, rule_str, sizeof(rule_str));
 			snprintk(keep_reason, sizeof(keep_reason),
-				 "no prior sample, st %s", rule_str);
+				 "no prior sample, st %.3f", st_value);
 		} else {
 			double delta = sample_value - entry->last_reported.f;
 
@@ -1198,15 +1159,11 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 
 			if (delta >= st_value) {
 				trigger = true;
-				send_sched_format_value(delta, sample_str, sizeof(sample_str));
-				send_sched_format_value(st_value, rule_str, sizeof(rule_str));
 				snprintk(keep_reason, sizeof(keep_reason),
-					 "delta %s >= st %s", sample_str, rule_str);
+					 "delta %.3f >= st %.3f", delta, st_value);
 			} else if (!drop_reason_set) {
-				send_sched_format_value(delta, sample_str, sizeof(sample_str));
-				send_sched_format_value(st_value, rule_str, sizeof(rule_str));
 				snprintk(drop_reason, sizeof(drop_reason),
-					 "delta %s < st %s", sample_str, rule_str);
+					 "delta %.3f < st %.3f", delta, st_value);
 				drop_reason_set = true;
 			}
 		}
@@ -1254,9 +1211,9 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 		entry->pmin_deadline_ms = 0;
 	}
 
-	if (entry->has_pmax && entry->pmax_seconds > 0) {
+	if (entry->pmax_seconds > 0) {
 		entry->pmax_deadline_ms = entry->last_accept_ms +
-			((int64_t)entry->pmax_seconds * SEND_SCHED_MSEC_PER_SEC);
+			((int64_t)entry->pmax_seconds * 1000LL);
 		send_sched_arm_pmax_timer(entry);
 	} else {
 		send_sched_cancel_pmax_timer(entry);
@@ -1288,6 +1245,7 @@ int send_scheduler_init(void)
 		send_sched_ctrl_obj.field_count = ARRAY_SIZE(send_sched_ctrl_fields);
 		send_sched_ctrl_obj.max_instance_count = 1U;
 		send_sched_ctrl_obj.create_cb = send_sched_ctrl_create;
+		send_sched_ctrl_obj.delete_cb = send_sched_ctrl_delete;
 		lwm2m_register_obj(&send_sched_ctrl_obj);
 
 		send_sched_rules_obj.obj_id = SEND_SCHED_RULES_OBJECT_ID;
@@ -1303,7 +1261,7 @@ int send_scheduler_init(void)
 
 		registered = true;
 	} else {
-		LOG_INF("already registered send scheduler objects");
+		LOG_DBG("already registered send scheduler objects");
 	}
 
 	ret = lwm2m_create_obj_inst(SEND_SCHED_CTRL_OBJECT_ID, 0, &obj_inst);
@@ -1311,13 +1269,6 @@ int send_scheduler_init(void)
 		LOG_ERR("Failed to instantiate scheduler control object (%d)", ret);
 		return ret;
 	}
-
-/*	obj_inst = NULL;
-	ret = lwm2m_create_obj_inst(SEND_SCHED_RULES_OBJECT_ID, 0, &obj_inst);
-	if (ret < 0 && ret != -EEXIST) {
-		LOG_ERR("Failed to instantiate sampling rules object (%d)", ret);
-		return ret;
-	}*/
 
 	return 0;
 }

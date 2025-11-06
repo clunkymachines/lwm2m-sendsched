@@ -3,7 +3,7 @@
        xsi:noNamespaceSchemaLocation="http://www.openmobilealliance.org/tech/profiles/LWM2M-v1_1.xsd">
   <Object ObjectType="MODefinition">
     <Name>Scheduler Control</Name>
-    <Description1>Controls buffering behaviour of the custom send scheduler.</Description1>
+    <Description1>Controls buffering behaviour of the send scheduler.</Description1>
     <ObjectID>20000</ObjectID>
     <ObjectURN>urn:oma:lwm2m:x:20000:1.0</ObjectURN>
     <LWM2MVersion>1.1</LWM2MVersion>
