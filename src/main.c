@@ -11,6 +11,7 @@
 
 #include "send_scheduler.h"
 #include "temperature_sensor.h"
+#include "humidity_sensor.h"
 LOG_MODULE_REGISTER(lwm2m_base_client, LOG_LEVEL_INF);
 
 #define APP_BANNER "LwM2M base client"
@@ -118,6 +119,11 @@ static int lwm2m_setup(void)
 	}
 
 	ret = temperature_sensor_init();
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = humidity_sensor_init();
 	if (ret < 0) {
 		return ret;
 	}

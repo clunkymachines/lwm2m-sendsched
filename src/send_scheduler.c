@@ -18,7 +18,7 @@
 #include "lwm2m_registry.h"
 
 #define LOG_MODULE_NAME send_scheduler
-LOG_MODULE_REGISTER(LOG_MODULE_NAME, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(LOG_MODULE_NAME, CONFIG_SEND_SCHED_LOG_LEVEL);
 
 /* Use a vendor-specific object range for custom objects */
 #define SEND_SCHED_CTRL_OBJECT_ID 20000
@@ -67,7 +67,10 @@ struct send_sched_rule_entry {
 
 static bool scheduler_paused;       /* Reflects /20000/0/0 (pause flag) */
 static int32_t scheduler_max_samples; /* Placeholder for /20000/0/1, currently unused */
-static int32_t scheduler_max_age;     /* Placeholder for /20000/0/2, currently unused */
+static int32_t scheduler_max_age;     /* Max age threshold in seconds; <=0 disables enforcement */
+static struct k_work_delayable scheduler_age_work;
+static bool scheduler_age_work_initialized;
+static bool scheduler_max_age_cb_registered;
 
 static struct send_sched_rule_entry rule_entries[SEND_SCHED_RULES_MAX_INSTANCES];
 
@@ -77,13 +80,13 @@ static int send_sched_validate_path(uint16_t obj_inst_id, uint16_t res_id,
 				    bool last_block, size_t total_size, size_t offset);
 /* Validate rule syntax and prevent conflicts per instance */
 static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
-				    uint16_t res_inst_id, uint8_t *data, uint16_t data_len,
-				    bool last_block, size_t total_size, size_t offset);
+			    uint16_t res_inst_id, uint8_t *data, uint16_t data_len,
+			    bool last_block, size_t total_size, size_t offset);
 static int send_sched_flush_cb(uint16_t obj_inst_id, uint8_t *args, uint16_t args_len);
 static int send_sched_collect_paths(struct lwm2m_obj_path *paths, size_t max_paths);
 static int send_sched_parse_path(const char *path, struct lwm2m_obj_path *out);
 static bool send_sched_paths_equal(const struct lwm2m_obj_path *lhs,
-				   const struct lwm2m_obj_path *rhs);
+			   const struct lwm2m_obj_path *rhs);
 static int send_sched_find_rule_entry(const struct lwm2m_obj_path *path,
 				      struct lwm2m_obj_path *parsed_path);
 static bool send_sched_rule_parse_double(const char *rule, const char *attr,
@@ -92,10 +95,21 @@ static int send_sched_rules_delete(uint16_t obj_inst_id);
 #define send_sched_log_decision(verb, path_str, sample, reason) \
 	LOG_DBG("%s %s sample %.3f: %s", verb, path_str, sample, reason)
 static bool send_sched_rule_parse_int(const char *rule, const char *attr,
-				      int32_t *out_value);
+			      int32_t *out_value);
 static void send_sched_cancel_pmax_timer(struct send_sched_rule_entry *entry);
 static void send_sched_arm_pmax_timer(struct send_sched_rule_entry *entry);
 static void send_sched_pmax_work_handler(struct k_work *work);
+static void send_sched_age_work_handler(struct k_work *work);
+static int send_sched_flush_all(void);
+static void send_sched_maybe_flush_on_full(struct send_sched_rule_entry *entry);
+static void send_sched_schedule_age_check(void);
+static void send_sched_process_max_age(bool allow_flush);
+static bool send_sched_find_oldest_timestamp(time_t *out_ts);
+static int send_sched_ctrl_max_age_post_write_cb(uint16_t obj_inst_id,
+				       uint16_t res_id, uint16_t res_inst_id,
+				       uint8_t *data, uint16_t data_len,
+				       bool last_block, size_t total_size,
+				       size_t offset);
 
 /* Compare two LwM2M paths for equality */
 static bool send_sched_paths_equal(const struct lwm2m_obj_path *lhs,
@@ -357,16 +371,12 @@ static void send_sched_arm_pmax_timer(struct send_sched_rule_entry *entry)
 }
 
 /* Trigger a composite SEND for cached resources */
-static int send_sched_flush_cb(uint16_t obj_inst_id, uint8_t *args, uint16_t args_len)
+static int send_sched_flush_all(void)
 {
 	struct lwm2m_ctx *ctx;
 	struct lwm2m_obj_path path_list[SEND_SCHED_RULES_MAX_INSTANCES];
 	int path_count;
 	int ret;
-
-	ARG_UNUSED(obj_inst_id);
-	ARG_UNUSED(args);
-	ARG_UNUSED(args_len);
 
 	ctx = lwm2m_rd_client_ctx();
 	if (!ctx) {
@@ -389,12 +399,23 @@ static int send_sched_flush_cb(uint16_t obj_inst_id, uint8_t *args, uint16_t arg
 	ret = lwm2m_send_cb(ctx, path_list, (uint8_t)path_count, NULL);
 	if (ret < 0) {
 		LOG_ERR("Failed to flush cached data (%d)", ret);
-		return ret;
+	} else {
+		LOG_INF("Triggered LwM2M send for %d cached path(s)", path_count);
 	}
 
-	LOG_INF("Triggered LwM2M send for %d cached path(s)", path_count);
+	send_sched_schedule_age_check();
 
-	return 0;
+	return ret;
+}
+
+static int send_sched_flush_cb(uint16_t obj_inst_id, uint8_t *args, uint16_t args_len)
+{
+	ARG_UNUSED(obj_inst_id);
+	ARG_UNUSED(args);
+	ARG_UNUSED(args_len);
+
+	LOG_DBG("Manual flush requested");
+    return send_sched_flush_all();
 }
 
 static struct lwm2m_engine_obj send_sched_ctrl_obj;
@@ -448,6 +469,26 @@ static int send_sched_ctrl_delete(uint16_t obj_inst_id)
 	ARG_UNUSED(obj_inst_id);
 	LOG_WRN("Scheduler control object cannot be deleted");
 	return -EBUSY;
+}
+
+static int send_sched_ctrl_max_age_post_write_cb(uint16_t obj_inst_id,
+				       uint16_t res_id, uint16_t res_inst_id,
+				       uint8_t *data, uint16_t data_len,
+				       bool last_block, size_t total_size,
+				       size_t offset)
+{
+	ARG_UNUSED(obj_inst_id);
+	ARG_UNUSED(res_id);
+	ARG_UNUSED(res_inst_id);
+	ARG_UNUSED(data);
+	ARG_UNUSED(data_len);
+	ARG_UNUSED(last_block);
+	ARG_UNUSED(total_size);
+	ARG_UNUSED(offset);
+
+	send_sched_process_max_age(true);
+
+	return 0;
 }
 
 static struct lwm2m_engine_obj send_sched_rules_obj;
@@ -576,6 +617,7 @@ static int send_sched_validate_path(uint16_t obj_inst_id, uint16_t res_id,
 		rule_entries[entry_idx].has_cached_path = false;
 		rule_entries[entry_idx].has_last_reported = false;
 		rule_entries[entry_idx].has_last_observed = false;
+		send_sched_schedule_age_check();
 	}
 
 	copy_len = MIN((size_t)data_len, sizeof(path_buf) - 1U);
@@ -867,7 +909,9 @@ static int send_sched_rules_delete(uint16_t obj_inst_id)
 	memset(&send_sched_rules_res[idx], 0, sizeof(send_sched_rules_res[idx]));
 	memset(&send_sched_rules_inst[idx], 0, sizeof(send_sched_rules_inst[idx]));
 	init_res_instance(send_sched_rules_res_inst[idx],
-			  ARRAY_SIZE(send_sched_rules_res_inst[idx]));
+		  ARRAY_SIZE(send_sched_rules_res_inst[idx]));
+
+	send_sched_schedule_age_check();
 
 	return 0;
 }
@@ -927,6 +971,7 @@ static void send_sched_pmax_work_handler(struct k_work *work)
 			snprintk(reason, sizeof(reason), "pmax %d expired (cached)",
 				 entry->pmax_seconds);
 			send_sched_log_decision("Cache", path_str, elem.f, reason);
+			send_sched_schedule_age_check();
 		}
 	} else {
 		LOG_DBG("pmax timer fired for %s before any sample cached", entry->path);
@@ -951,6 +996,145 @@ static void send_sched_pmax_work_handler(struct k_work *work)
 	} else {
 		entry->pmax_deadline_ms = 0;
 	}
+}
+
+/* Push cached samples immediately when a buffer is full */
+static void send_sched_maybe_flush_on_full(struct send_sched_rule_entry *entry)
+{
+	int slots;
+
+	if (!entry || !entry->has_cached_path) {
+		return;
+	}
+
+	slots = lwm2m_cache_free_slots_get(&entry->cached_path);
+	if (slots < 0) {
+		/* No cache entry or API failure, nothing to do */
+		return;
+	}
+
+	if (slots == 0) {
+		LOG_DBG("Cache full for %s, triggering global SEND", entry->path);
+	(void)send_sched_flush_all();
+	}
+}
+
+static void send_sched_ensure_age_work_initialized(void)
+{
+	if (!scheduler_age_work_initialized) {
+		k_work_init_delayable(&scheduler_age_work, send_sched_age_work_handler);
+		scheduler_age_work_initialized = true;
+	}
+}
+
+static bool send_sched_find_oldest_timestamp(time_t *out_ts)
+{
+	bool found = false;
+	time_t oldest = 0;
+
+	for (int idx = 0; idx < SEND_SCHED_RULES_MAX_INSTANCES; idx++) {
+		struct send_sched_rule_entry *entry = &rule_entries[idx];
+		struct lwm2m_obj_path path;
+		struct lwm2m_time_series_resource *cache_entry;
+		struct lwm2m_time_series_elem elem;
+
+		if (entry->path[0] == '\0') {
+			continue;
+		}
+
+		if (entry->has_cached_path) {
+			path = entry->cached_path;
+		} else if (send_sched_parse_path(entry->path, &path) < 0) {
+			continue;
+		}
+
+		cache_entry = lwm2m_cache_entry_get_by_object(&path);
+		if (!cache_entry || ring_buf_is_empty(&cache_entry->rb)) {
+			continue;
+		}
+
+		if (ring_buf_peek(&cache_entry->rb, (uint8_t *)&elem,
+				  sizeof(elem)) != sizeof(elem)) {
+			continue;
+		}
+
+		if (!found || elem.t < oldest) {
+			oldest = elem.t;
+			found = true;
+		}
+	}
+
+	if (found && out_ts) {
+		*out_ts = oldest;
+	}
+
+	return found;
+}
+
+static void send_sched_process_max_age(bool allow_flush)
+{
+	if (scheduler_max_age <= 0) {
+		if (scheduler_age_work_initialized) {
+			k_work_cancel_delayable(&scheduler_age_work);
+		}
+		return;
+	}
+
+	send_sched_ensure_age_work_initialized();
+
+	time_t now = time(NULL);
+	time_t oldest_ts;
+
+	if (now <= 0 || !send_sched_find_oldest_timestamp(&oldest_ts)) {
+		if (scheduler_age_work_initialized) {
+			k_work_cancel_delayable(&scheduler_age_work);
+		}
+		return;
+	}
+
+	int64_t age = (int64_t)now - (int64_t)oldest_ts;
+	if (age < 0) {
+		age = 0;
+	}
+
+	if (allow_flush && age >= scheduler_max_age) {
+		LOG_INF("Oldest cached sample age %llds exceeds max %ds, forcing SEND",
+			(long long)age, scheduler_max_age);
+		(void)send_sched_flush_all();
+		send_sched_schedule_age_check();
+		return;
+	}
+
+	int64_t remaining = (int64_t)scheduler_max_age - age;
+	if (remaining < 1) {
+		remaining = 1;
+	}
+
+	int64_t delay_ms = remaining * 1000LL;
+	if (delay_ms > INT32_MAX) {
+		delay_ms = INT32_MAX;
+	}
+
+	k_work_reschedule(&scheduler_age_work, K_MSEC((uint32_t)delay_ms));
+}
+
+static void send_sched_schedule_age_check(void)
+{
+	if (scheduler_max_age <= 0) {
+		if (scheduler_age_work_initialized) {
+			k_work_cancel_delayable(&scheduler_age_work);
+		}
+		return;
+	}
+
+	send_sched_process_max_age(false);
+}
+
+static void send_sched_age_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	send_sched_process_max_age(true);
 }
 
 /* Decide whether a sample should be cached for the configured path */
@@ -1225,6 +1409,8 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	}
 
 	send_sched_log_decision("Keep", path_str, sample_value, keep_reason);
+	send_sched_maybe_flush_on_full(entry);
+	send_sched_schedule_age_check();
 
 	return true;
 }
@@ -1268,6 +1454,18 @@ int send_scheduler_init(void)
 	if (ret < 0 && ret != -EEXIST) {
 		LOG_ERR("Failed to instantiate scheduler control object (%d)", ret);
 		return ret;
+	}
+
+	if (!scheduler_max_age_cb_registered) {
+		int cb_ret = lwm2m_register_post_write_callback(
+			&LWM2M_OBJ(SEND_SCHED_CTRL_OBJECT_ID, 0,
+				    SEND_SCHED_CTRL_RES_MAX_AGE),
+			send_sched_ctrl_max_age_post_write_cb);
+		if (cb_ret < 0) {
+			LOG_ERR("Failed to register max-age callback (%d)", cb_ret);
+			return cb_ret;
+		}
+		scheduler_max_age_cb_registered = true;
 	}
 
 	return 0;
