@@ -68,11 +68,13 @@ struct send_sched_rule_entry {
 };
 
 static bool scheduler_paused;       /* Reflects /20000/0/0 (pause flag) */
-static int32_t scheduler_max_samples; /* Placeholder for /20000/0/1, currently unused */
+static int32_t scheduler_max_samples; /* Upper bound for buffered samples; <=0 disables */
 static int32_t scheduler_max_age;     /* Max age threshold in seconds; <=0 disables enforcement */
 static struct k_work_delayable scheduler_age_work;
 static bool scheduler_age_work_initialized;
 static bool scheduler_max_age_cb_registered;
+static bool scheduler_max_samples_cb_registered;
+static int32_t scheduler_accumulated_samples;
 
 static struct send_sched_rule_entry rule_entries[SEND_SCHED_RULES_MAX_INSTANCES];
 
@@ -110,10 +112,18 @@ static void send_sched_schedule_age_check(void);
 static void send_sched_process_max_age(bool allow_flush);
 static bool send_sched_find_oldest_timestamp(time_t *out_ts);
 static int send_sched_ctrl_max_age_post_write_cb(uint16_t obj_inst_id,
-				       uint16_t res_id, uint16_t res_inst_id,
-				       uint8_t *data, uint16_t data_len,
-				       bool last_block, size_t total_size,
-				       size_t offset);
+			       uint16_t res_id, uint16_t res_inst_id,
+			       uint8_t *data, uint16_t data_len,
+			       bool last_block, size_t total_size,
+			       size_t offset);
+static void send_sched_reset_accumulated_samples(void);
+static void send_sched_record_cached_sample(void);
+static void send_sched_enforce_max_sample_limit(void);
+static int send_sched_ctrl_max_samples_post_write_cb(uint16_t obj_inst_id,
+			       uint16_t res_id, uint16_t res_inst_id,
+			       uint8_t *data, uint16_t data_len,
+			       bool last_block, size_t total_size,
+			       size_t offset);
 
 /* Compare two LwM2M paths for equality */
 static bool send_sched_paths_equal(const struct lwm2m_obj_path *lhs,
@@ -430,9 +440,38 @@ static int send_sched_flush_all(void)
 		LOG_INF("Triggered LwM2M send for %d cached path(s)", path_count);
 	}
 
+	send_sched_reset_accumulated_samples();
 	send_sched_schedule_age_check();
 
 	return ret;
+}
+
+static void send_sched_reset_accumulated_samples(void)
+{
+	scheduler_accumulated_samples = 0;
+}
+
+static void send_sched_enforce_max_sample_limit(void)
+{
+	if (scheduler_max_samples <= 0) {
+		return;
+	}
+
+	if (scheduler_accumulated_samples >= scheduler_max_samples) {
+		LOG_INF("Accumulated %d samples (limit %d), forcing SEND",
+			scheduler_accumulated_samples, scheduler_max_samples);
+		scheduler_accumulated_samples = 0;
+		(void)send_sched_flush_all();
+	}
+}
+
+static void send_sched_record_cached_sample(void)
+{
+	if (scheduler_accumulated_samples < INT32_MAX) {
+		scheduler_accumulated_samples++;
+	}
+
+	send_sched_enforce_max_sample_limit();
 }
 
 static int send_sched_flush_cb(uint16_t obj_inst_id, uint8_t *args, uint16_t args_len)
@@ -499,10 +538,10 @@ static int send_sched_ctrl_delete(uint16_t obj_inst_id)
 }
 
 static int send_sched_ctrl_max_age_post_write_cb(uint16_t obj_inst_id,
-				       uint16_t res_id, uint16_t res_inst_id,
-				       uint8_t *data, uint16_t data_len,
-				       bool last_block, size_t total_size,
-				       size_t offset)
+			       uint16_t res_id, uint16_t res_inst_id,
+			       uint8_t *data, uint16_t data_len,
+			       bool last_block, size_t total_size,
+			       size_t offset)
 {
 	ARG_UNUSED(obj_inst_id);
 	ARG_UNUSED(res_id);
@@ -514,6 +553,31 @@ static int send_sched_ctrl_max_age_post_write_cb(uint16_t obj_inst_id,
 	ARG_UNUSED(offset);
 
 	send_sched_process_max_age(true);
+
+	return 0;
+}
+
+static int send_sched_ctrl_max_samples_post_write_cb(uint16_t obj_inst_id,
+			       uint16_t res_id, uint16_t res_inst_id,
+			       uint8_t *data, uint16_t data_len,
+			       bool last_block, size_t total_size,
+			       size_t offset)
+{
+	ARG_UNUSED(obj_inst_id);
+	ARG_UNUSED(res_id);
+	ARG_UNUSED(res_inst_id);
+	ARG_UNUSED(data);
+	ARG_UNUSED(data_len);
+	ARG_UNUSED(last_block);
+	ARG_UNUSED(total_size);
+	ARG_UNUSED(offset);
+
+	if (scheduler_max_samples <= 0) {
+		send_sched_reset_accumulated_samples();
+		return 0;
+	}
+
+	send_sched_enforce_max_sample_limit();
 
 	return 0;
 }
@@ -1450,6 +1514,7 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	}
 
 	send_sched_log_decision("Keep", path_str, sample_value, keep_reason);
+	send_sched_record_cached_sample();
 	send_sched_maybe_flush_on_full(entry);
 	send_sched_schedule_age_check();
 
@@ -1495,6 +1560,18 @@ int send_scheduler_init(void)
 	if (ret < 0 && ret != -EEXIST) {
 		LOG_ERR("Failed to instantiate scheduler control object (%d)", ret);
 		return ret;
+	}
+
+	if (!scheduler_max_samples_cb_registered) {
+		int cb_ret = lwm2m_register_post_write_callback(
+			&LWM2M_OBJ(SEND_SCHED_CTRL_OBJECT_ID, 0,
+				    SEND_SCHED_CTRL_RES_MAX_SAMPLES),
+			send_sched_ctrl_max_samples_post_write_cb);
+		if (cb_ret < 0) {
+			LOG_ERR("Failed to register max-samples callback (%d)", cb_ret);
+			return cb_ret;
+		}
+		scheduler_max_samples_cb_registered = true;
 	}
 
 	if (!scheduler_max_age_cb_registered) {
