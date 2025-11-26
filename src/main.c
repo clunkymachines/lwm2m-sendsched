@@ -19,7 +19,8 @@ LOG_MODULE_REGISTER(lwm2m_base_client, LOG_LEVEL_INF);
 static struct lwm2m_ctx client_ctx;
 
 static const char *const endpoint =
-	sizeof(CONFIG_NET_SAMPLE_LWM2M_ID) > 1 ? CONFIG_NET_SAMPLE_LWM2M_ID : CONFIG_BOARD;
+	sizeof(CONFIG_NET_SAMPLE_LWM2M_ID) > 1 ? CONFIG_NET_SAMPLE_LWM2M_ID :
+						 CONFIG_BOARD;
 
 #if defined(CONFIG_NET_CONNECTION_MANAGER)
 static K_SEM_DEFINE(network_connected_sem, 0, 1);
@@ -39,7 +40,8 @@ static uint8_t bat_status = LWM2M_DEVICE_BATTERY_STATUS_CHARGING;
 static int mem_free = 15;
 static int mem_total = 25;
 
-static int device_reboot_cb(uint16_t obj_inst_id, uint8_t *args, uint16_t args_len)
+static int device_reboot_cb(uint16_t obj_inst_id, uint8_t *args,
+			    uint16_t args_len)
 {
 	ARG_UNUSED(obj_inst_id);
 	ARG_UNUSED(args);
@@ -73,13 +75,16 @@ static int lwm2m_setup(void)
 			  sizeof(manufacturer), LWM2M_RES_DATA_FLAG_RO);
 	lwm2m_set_res_buf(&LWM2M_OBJ(3, 0, 1), model_number, sizeof(model_number),
 			  sizeof(model_number), LWM2M_RES_DATA_FLAG_RO);
-	lwm2m_set_res_buf(&LWM2M_OBJ(3, 0, 2), serial_number, sizeof(serial_number),
+	lwm2m_set_res_buf(&LWM2M_OBJ(3, 0, 2), serial_number,
+			  sizeof(serial_number),
 			  sizeof(serial_number), LWM2M_RES_DATA_FLAG_RO);
-	lwm2m_set_res_buf(&LWM2M_OBJ(3, 0, 3), firmware_version, sizeof(firmware_version),
+	lwm2m_set_res_buf(&LWM2M_OBJ(3, 0, 3), firmware_version,
+			  sizeof(firmware_version),
 			  sizeof(firmware_version), LWM2M_RES_DATA_FLAG_RO);
 	lwm2m_set_res_buf(&LWM2M_OBJ(3, 0, 17), CONFIG_BOARD, sizeof(CONFIG_BOARD),
 			  sizeof(CONFIG_BOARD), LWM2M_RES_DATA_FLAG_RO);
-	lwm2m_set_res_buf(&LWM2M_OBJ(3, 0, 18), hardware_version, sizeof(hardware_version),
+	lwm2m_set_res_buf(&LWM2M_OBJ(3, 0, 18), hardware_version,
+			  sizeof(hardware_version),
 			  sizeof(hardware_version), LWM2M_RES_DATA_FLAG_RO);
 
 	lwm2m_register_exec_callback(&LWM2M_OBJ(3, 0, 4), device_reboot_cb);
@@ -131,7 +136,8 @@ static int lwm2m_setup(void)
 	return 0;
 }
 
-static void rd_client_event(struct lwm2m_ctx *ctx, enum lwm2m_rd_client_event event)
+static void rd_client_event(struct lwm2m_ctx *ctx,
+			    enum lwm2m_rd_client_event event)
 {
 	ARG_UNUSED(ctx);
 
