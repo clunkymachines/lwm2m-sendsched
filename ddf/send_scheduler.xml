@@ -1,4 +1,35 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- BSD-3 Clause License
+
+  Copyright 2023 Clunky Machines
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions
+  are met:
+
+  1. Redistributions of source code must retain the above copyright
+  notice, this list of conditions and the following disclaimer.
+  2. Redistributions in binary form must reproduce the above copyright
+  notice, this list of conditions and the following disclaimer in the
+  documentation and/or other materials provided with the distribution.
+  3. Neither the name of the copyright holder nor the names of its
+  contributors may be used to endorse or promote products derived
+  from this software without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+  COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+
+-->
 <LWM2M xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
        xsi:noNamespaceSchemaLocation="http://www.openmobilealliance.org/tech/profiles/LWM2M-v1_1.xsd">
   <Object ObjectType="MODefinition">
@@ -12,7 +43,7 @@
     <Mandatory>Optional</Mandatory>
     <Resources>
       <Item ID="0">
-        <Name>paused</Name>
+        <Name>Paused</Name>
         <Operations>RW</Operations>
         <MultipleInstances>Single</MultipleInstances>
         <Mandatory>Mandatory</Mandatory>
@@ -22,7 +53,7 @@
         <Description>Set to true to pause accumulation; clearing the flag resumes scheduling.</Description>
       </Item>
       <Item ID="1">
-        <Name>max samples</Name>
+        <Name>Max Samples</Name>
         <Operations>RW</Operations>
         <MultipleInstances>Single</MultipleInstances>
         <Mandatory>Mandatory</Mandatory>
@@ -32,7 +63,7 @@
         <Description>Number of buffered samples allowed before a transmission is forced.</Description>
       </Item>
       <Item ID="2">
-        <Name>max old</Name>
+        <Name>Max Old</Name>
         <Operations>RW</Operations>
         <MultipleInstances>Single</MultipleInstances>
         <Mandatory>Mandatory</Mandatory>
@@ -42,7 +73,7 @@
         <Description>Maximum age in seconds permitted for the oldest buffered sample before a transmission is forced.</Description>
       </Item>
       <Item ID="3">
-        <Name>flush</Name>
+        <Name>Flush</Name>
         <Operations>E</Operations>
         <MultipleInstances>Single</MultipleInstances>
         <Mandatory>Optional</Mandatory>
@@ -52,7 +83,7 @@
         <Description>Execute to trigger an immediate data push for all resources covered by active sampling rules.</Description>
       </Item>
       <Item ID="4">
-        <Name>flush on registration update</Name>
+        <Name>Flush On Registration Update</Name>
         <Operations>RW</Operations>
         <MultipleInstances>Single</MultipleInstances>
         <Mandatory>Mandatory</Mandatory>
@@ -75,7 +106,7 @@
     <Mandatory>Optional</Mandatory>
     <Resources>
       <Item ID="0">
-        <Name>path</Name>
+        <Name>Path</Name>
         <Operations>RW</Operations>
         <MultipleInstances>Single</MultipleInstances>
         <Mandatory>Mandatory</Mandatory>
@@ -85,14 +116,14 @@
         <Description>LwM2M resource path to monitor, e.g. /3303/0/5700. The value must reference a resource (/Object/Instance/Resource) with numeric segments.</Description>
       </Item>
       <Item ID="1">
-        <Name>collection rules</Name>
+        <Name>Collection Rules</Name>
         <Operations>RW</Operations>
         <MultipleInstances>Multiple</MultipleInstances>
         <Mandatory>Optional</Mandatory>
         <Type>String</Type>
         <RangeEnumeration></RangeEnumeration>
         <Units></Units>
-        <Description>Rule strings formatted as attribute=value. Supported attributes are pmin, pmax, epmin, epmax (integer values) and gt, lt, st (floating point values). Each attribute may appear at most once per instance.</Description>
+        <Description>Rule strings formatted as attribute=value. Supported attributes are pmin, pmax, epmin, epmax (integer values) and gt, lt, st (floating point values). Each attribute may appear at most once per instance. Example: \"pmin=10,pmax=60,gt=25.0\".</Description>
       </Item>
     </Resources>
     <Description2></Description2>
