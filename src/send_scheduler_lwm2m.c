@@ -28,10 +28,11 @@ LOG_MODULE_DECLARE(send_scheduler, CONFIG_SEND_SCHED_LOG_LEVEL);
 #define SEND_SCHED_CTRL_RES_MAX_SAMPLES 1
 #define SEND_SCHED_CTRL_RES_MAX_AGE 2
 #define SEND_SCHED_CTRL_RES_FLUSH 3
+#define SEND_SCHED_CTRL_RES_FLUSH_ON_UPDATE 4
 #define SEND_SCHED_RULES_RES_PATH 0
 #define SEND_SCHED_RULES_RES_RULES 1
 
-#define SEND_SCHED_CTRL_RES_COUNT 4
+#define SEND_SCHED_CTRL_RES_COUNT 5
 #define SEND_SCHED_CTRL_RES_INST_COUNT SEND_SCHED_CTRL_RES_COUNT
 
 #define SEND_SCHED_RULES_RES_COUNT 2
@@ -43,6 +44,7 @@ static struct lwm2m_engine_obj_field send_sched_ctrl_fields[] = {
 	OBJ_FIELD(SEND_SCHED_CTRL_RES_MAX_SAMPLES, RW, S32),
 	OBJ_FIELD(SEND_SCHED_CTRL_RES_MAX_AGE, RW, S32),
 	OBJ_FIELD_EXECUTE(SEND_SCHED_CTRL_RES_FLUSH),
+	OBJ_FIELD(SEND_SCHED_CTRL_RES_FLUSH_ON_UPDATE, RW, BOOL),
 };
 static struct lwm2m_engine_res send_sched_ctrl_res[SEND_SCHED_CTRL_RES_COUNT];
 static struct lwm2m_engine_res_inst send_sched_ctrl_res_inst
@@ -311,6 +313,7 @@ static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
 		send_sched_rules_res_inst[entry_idx][current_slot].data_len = 0U;
 		entry->has_last_reported = false;
 		entry->has_last_observed = false;
+		entry->rules_dirty = true;
 		return 0;
 	}
 
@@ -388,6 +391,7 @@ static int send_sched_validate_rule(uint16_t obj_inst_id, uint16_t res_id,
 		}
 	}
 
+	entry->rules_dirty = true;
 	return 0;
 }
 
@@ -433,6 +437,10 @@ send_sched_ctrl_create(uint16_t obj_inst_id)
 			  &scheduler_max_age, sizeof(scheduler_max_age));
 	INIT_OBJ_RES_EXECUTE(SEND_SCHED_CTRL_RES_FLUSH, send_sched_ctrl_res, i,
 			     send_sched_flush_cb);
+	INIT_OBJ_RES_DATA(SEND_SCHED_CTRL_RES_FLUSH_ON_UPDATE, send_sched_ctrl_res, i,
+			  send_sched_ctrl_res_inst, j,
+			  &send_sched_flush_on_update,
+			  sizeof(send_sched_flush_on_update));
 
 	send_sched_ctrl_inst.resources = send_sched_ctrl_res;
 	send_sched_ctrl_inst.resource_count = i;

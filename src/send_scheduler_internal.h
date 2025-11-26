@@ -35,11 +35,23 @@ struct send_sched_rule_entry {
 	int32_t pmax_seconds; /* Cached pmax seconds value */
 	struct k_work_delayable pmax_work; /* Work item used to enforce pmax */
 	bool pmax_timer_active; /* True if the pmax timer is scheduled */
+	bool rules_dirty; /* True when parsed rule cache needs refresh */
+	bool has_rule_gt;
+	bool has_rule_lt;
+	bool has_rule_st;
+	bool has_rule_pmin;
+	bool has_rule_pmax;
+	double rule_gt_value;
+	double rule_lt_value;
+	double rule_st_value;
+	int32_t rule_pmin_seconds;
+	int32_t rule_pmax_seconds;
 };
 
 extern bool scheduler_paused;
 extern int32_t scheduler_max_samples;
 extern int32_t scheduler_max_age;
+extern bool send_sched_flush_on_update;
 extern struct send_sched_rule_entry
 	rule_entries[SEND_SCHED_RULES_MAX_INSTANCES];
 
@@ -53,5 +65,6 @@ void send_sched_schedule_age_check(void);
 void send_sched_process_max_age(bool allow_flush);
 void send_sched_enforce_max_sample_limit(void);
 void send_sched_reset_accumulated_samples(void);
+void send_sched_handle_registration_event(void);
 
 #endif /* SEND_SCHEDULER_INTERNAL_H_ */

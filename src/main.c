@@ -144,9 +144,14 @@ static void rd_client_event(struct lwm2m_ctx *ctx,
 	switch (event) {
 	case LWM2M_RD_CLIENT_EVENT_REGISTRATION_COMPLETE:
 		LOG_INF("Registration complete");
+		send_sched_handle_registration_event();
 		break;
 	case LWM2M_RD_CLIENT_EVENT_REG_UPDATE_COMPLETE:
 		LOG_INF("Registration update complete");
+		send_sched_handle_registration_event();
+		break;
+	case LWM2M_RD_CLIENT_EVENT_REG_UPDATE:
+		LOG_INF("Registration update in progress");
 		break;
 	case LWM2M_RD_CLIENT_EVENT_DEREGISTER:
 		LOG_INF("Client deregistered");

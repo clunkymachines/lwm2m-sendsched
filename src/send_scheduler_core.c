@@ -24,6 +24,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME, CONFIG_SEND_SCHED_LOG_LEVEL);
 bool scheduler_paused;
 int32_t scheduler_max_samples;
 int32_t scheduler_max_age;
+bool send_sched_flush_on_update = true;
 
 static struct k_work_delayable scheduler_age_work;
 static bool scheduler_age_work_initialized;
@@ -43,6 +44,9 @@ static void send_sched_maybe_flush_on_full(struct send_sched_rule_entry *entry);
 static void send_sched_ensure_age_work_initialized(void);
 static bool send_sched_find_oldest_timestamp(time_t *out_ts);
 static void send_sched_age_work_handler(struct k_work *work);
+static void send_sched_clear_cached_rules(struct send_sched_rule_entry *entry);
+static void send_sched_refresh_cached_rules(
+	struct send_sched_rule_entry *entry);
 
 #define send_sched_log_decision(verb, path_str, sample, reason) \
 	LOG_DBG("%s %s sample %.3f: %s", verb, path_str, sample, reason)
@@ -617,6 +621,86 @@ static void send_sched_age_work_handler(struct k_work *work)
 	send_sched_process_max_age(true);
 }
 
+static void send_sched_clear_cached_rules(struct send_sched_rule_entry *entry)
+{
+	entry->has_rule_gt = false;
+	entry->has_rule_lt = false;
+	entry->has_rule_st = false;
+	entry->has_rule_pmin = false;
+	entry->has_rule_pmax = false;
+	entry->rule_gt_value = 0.0;
+	entry->rule_lt_value = 0.0;
+	entry->rule_st_value = 0.0;
+	entry->rule_pmin_seconds = 0;
+	entry->rule_pmax_seconds = 0;
+	entry->rules_dirty = false;
+}
+
+static void send_sched_refresh_cached_rules(struct send_sched_rule_entry *entry)
+{
+	send_sched_clear_cached_rules(entry);
+
+	for (int idx = 0; idx < SEND_SCHED_MAX_RULE_STRINGS; idx++) {
+		const char *rule = entry->rules[idx];
+
+		if (rule[0] == '\0') {
+			continue;
+		}
+
+		if (!entry->has_rule_gt &&
+		    send_sched_rule_parse_double(rule, "gt",
+						 &entry->rule_gt_value)) {
+			entry->has_rule_gt = true;
+			continue;
+		}
+
+		if (!entry->has_rule_lt &&
+		    send_sched_rule_parse_double(rule, "lt",
+						 &entry->rule_lt_value)) {
+			entry->has_rule_lt = true;
+			continue;
+		}
+
+		if (!entry->has_rule_st &&
+		    send_sched_rule_parse_double(rule, "st",
+						 &entry->rule_st_value)) {
+			entry->has_rule_st = true;
+			continue;
+		}
+
+		if (!entry->has_rule_pmin &&
+		    send_sched_rule_parse_int(rule, "pmin",
+					      &entry->rule_pmin_seconds)) {
+			if (entry->rule_pmin_seconds < 0) {
+				entry->rule_pmin_seconds = 0;
+			}
+			entry->has_rule_pmin = true;
+			continue;
+		}
+
+		if (!entry->has_rule_pmax &&
+		    send_sched_rule_parse_int(rule, "pmax",
+					      &entry->rule_pmax_seconds)) {
+			if (entry->rule_pmax_seconds < 0) {
+				entry->rule_pmax_seconds = 0;
+			}
+			entry->has_rule_pmax = true;
+			continue;
+		}
+	}
+
+	entry->rules_dirty = false;
+}
+
+void send_sched_handle_registration_event(void)
+{
+	if (!send_sched_flush_on_update) {
+		return;
+	}
+
+	(void)send_sched_flush_all();
+}
+
 /* Decide whether a sample should be cached for the configured path */
 bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 				 const struct lwm2m_time_series_elem *element)
@@ -624,14 +708,6 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	int entry_idx;
 	struct lwm2m_obj_path entry_path;
 	struct send_sched_rule_entry *entry;
-	bool has_gt = false;
-	bool has_lt = false;
-	bool has_st = false;
-	bool has_pmin_rule = false;
-	bool has_pmax_rule = false;
-	double gt_value = 0.0;
-	double lt_value = 0.0;
-	double st_value = 0.0;
 	double sample_value;
 	bool trigger = false;
 	bool trigger_due_to_pmin_expiry = false;
@@ -641,8 +717,6 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 	char keep_reason[96] = {0};
 	char drop_reason[96] = {0};
 	bool drop_reason_set = false;
-	int32_t pmin_seconds = 0;
-	int32_t pmax_seconds = 0;
 	int64_t now_ms;
 
 	if (!path || !element) {
@@ -677,46 +751,20 @@ bool send_scheduler_cache_filter(const struct lwm2m_obj_path *path,
 		entry->has_last_observed = false;
 	}
 
-	for (int idx = 0; idx < SEND_SCHED_MAX_RULE_STRINGS; idx++) {
-		const char *rule = entry->rules[idx];
-
-		if (rule[0] == '\0') {
-			continue;
-		}
-
-		if (!has_gt && send_sched_rule_parse_double(rule, "gt", &gt_value)) {
-			has_gt = true;
-			continue;
-		}
-
-		if (!has_lt && send_sched_rule_parse_double(rule, "lt", &lt_value)) {
-			has_lt = true;
-			continue;
-		}
-
-		if (!has_st && send_sched_rule_parse_double(rule, "st", &st_value)) {
-			has_st = true;
-			continue;
-		}
-
-		if (!has_pmin_rule &&
-		    send_sched_rule_parse_int(rule, "pmin", &pmin_seconds)) {
-			if (pmin_seconds < 0) {
-				pmin_seconds = 0;
-			}
-			has_pmin_rule = true;
-			continue;
-		}
-
-		if (!has_pmax_rule &&
-		    send_sched_rule_parse_int(rule, "pmax", &pmax_seconds)) {
-			if (pmax_seconds < 0) {
-				pmax_seconds = 0;
-			}
-			has_pmax_rule = true;
-			continue;
-		}
+	if (entry->rules_dirty) {
+		send_sched_refresh_cached_rules(entry);
 	}
+
+	bool has_gt = entry->has_rule_gt;
+	bool has_lt = entry->has_rule_lt;
+	bool has_st = entry->has_rule_st;
+	bool has_pmin_rule = entry->has_rule_pmin;
+	bool has_pmax_rule = entry->has_rule_pmax;
+	double gt_value = entry->rule_gt_value;
+	double lt_value = entry->rule_lt_value;
+	double st_value = entry->rule_st_value;
+	int32_t pmin_seconds = entry->rule_pmin_seconds;
+	int32_t pmax_seconds = entry->rule_pmax_seconds;
 
 	bool effective_has_pmin = (has_pmin_rule && pmin_seconds > 0);
 	bool effective_has_pmax = (has_pmax_rule && pmax_seconds > 0);
