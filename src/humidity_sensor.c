@@ -1,16 +1,16 @@
 #define LOG_MODULE_NAME humidity_sensor
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(LOG_MODULE_NAME, CONFIG_SEND_SCHED_LOG_LEVEL);
+LOG_MODULE_REGISTER(LOG_MODULE_NAME, LOG_LEVEL_INF);
 
 #include <errno.h>
 #include <stdint.h>
 #include <zephyr/kernel.h>
 #include <zephyr/net/lwm2m.h>
+#include <zephyr/net/lwm2m_send_scheduler.h>
 #include <zephyr/random/random.h>
 #include <zephyr/sys/util.h>
 
 #include "humidity_sensor.h"
-#include "send_scheduler.h"
 
 #define HUMIDITY_OBJECT_ID 3304
 #define HUMIDITY_INSTANCE_ID 0
@@ -69,7 +69,7 @@ int humidity_sensor_init(void)
 		LOG_WRN("Failed to enable humidity cache (%d)", ret);
 	}
 
-	ret = lwm2m_set_cache_filter(&humidity_path, send_scheduler_cache_filter);
+	ret = lwm2m_set_cache_filter(&humidity_path, lwm2m_send_sched_cache_filter);
 	if (ret < 0) {
 		LOG_WRN("Failed to register humidity cache filter (%d)", ret);
 	}

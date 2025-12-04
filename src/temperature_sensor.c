@@ -6,10 +6,10 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME, LOG_LEVEL_INF);
 #include <stdint.h>
 #include <zephyr/kernel.h>
 #include <zephyr/net/lwm2m.h>
+#include <zephyr/net/lwm2m_send_scheduler.h>
 #include <zephyr/random/random.h>
 #include <zephyr/sys/util.h>
 
-#include "send_scheduler.h"
 #include "temperature_sensor.h"
 
 #define TEMPERATURE_OBJECT_ID 3303
@@ -71,7 +71,7 @@ int temperature_sensor_init(void)
 		LOG_WRN("Failed to enable temperature cache (%d)", ret);
 	}
 
-	ret = lwm2m_set_cache_filter(&temperature_path, send_scheduler_cache_filter);
+	ret = lwm2m_set_cache_filter(&temperature_path, lwm2m_send_sched_cache_filter);
 	if (ret < 0) {
 		LOG_WRN("Failed to register temperature cache filter (%d)", ret);
 	}

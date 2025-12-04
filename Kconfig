@@ -13,12 +13,4 @@ config NET_SAMPLE_LWM2M_SERVER
 	help
 	  Complete URI of the LwM2M server, for example "coap://1.2.3.4:5683".
 
-config SEND_SCHED_LOG_LEVEL
-	int "Send scheduler log level"
-	range 0 4
-	default 1
-	help
-	  Controls the Zephyr logging level for the custom send scheduler:
-	  0=none, 1=error, 2=warn, 3=info, 4=debug.
-
 source "Kconfig.zephyr"

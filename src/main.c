@@ -6,10 +6,10 @@
 #include <zephyr/net/net_mgmt.h>
 #include <zephyr/net/conn_mgr_monitor.h>
 #include <zephyr/net/conn_mgr_connectivity.h>
+#include <zephyr/net/lwm2m_send_scheduler.h>
 
 #include <string.h>
 
-#include "send_scheduler.h"
 #include "temperature_sensor.h"
 #include "humidity_sensor.h"
 LOG_MODULE_REGISTER(lwm2m_base_client, LOG_LEVEL_INF);
@@ -118,7 +118,7 @@ static int lwm2m_setup(void)
 	lwm2m_set_res_buf(&LWM2M_OBJ(3, 0, 8, 1), &usb_ma, sizeof(usb_ma),
 			  sizeof(usb_ma), 0);
 
-	ret = send_scheduler_init();
+	ret = lwm2m_send_sched_init();
 	if (ret < 0) {
 		return ret;
 	}
@@ -144,11 +144,11 @@ static void rd_client_event(struct lwm2m_ctx *ctx,
 	switch (event) {
 	case LWM2M_RD_CLIENT_EVENT_REGISTRATION_COMPLETE:
 		LOG_INF("Registration complete");
-		send_sched_handle_registration_event();
+		lwm2m_send_sched_handle_registration_event();
 		break;
 	case LWM2M_RD_CLIENT_EVENT_REG_UPDATE_COMPLETE:
 		LOG_INF("Registration update complete");
-		send_sched_handle_registration_event();
+		lwm2m_send_sched_handle_registration_event();
 		break;
 	case LWM2M_RD_CLIENT_EVENT_REG_UPDATE:
 		LOG_INF("Registration update in progress");

@@ -35,8 +35,8 @@
   <Object ObjectType="MODefinition">
     <Name>Scheduler Control</Name>
     <Description1>Controls buffering behaviour of the send scheduler.</Description1>
-    <ObjectID>20000</ObjectID>
-    <ObjectURN>urn:oma:lwm2m:x:20000:1.0</ObjectURN>
+    <ObjectID>10523</ObjectID>
+    <ObjectURN>urn:oma:lwm2m:x:10523:1.0</ObjectURN>
     <LWM2MVersion>1.1</LWM2MVersion>
     <ObjectVersion>1.0</ObjectVersion>
     <MultipleInstances>Single</MultipleInstances>
@@ -98,8 +98,8 @@
   <Object ObjectType="MODefinition">
     <Name>Sampling Rules</Name>
     <Description1>Defines per-resource sampling rules used by the send scheduler.</Description1>
-    <ObjectID>20001</ObjectID>
-    <ObjectURN>urn:oma:lwm2m:x:20001:1.0</ObjectURN>
+    <ObjectID>10524</ObjectID>
+    <ObjectURN>urn:oma:lwm2m:x:10524:1.0</ObjectURN>
     <LWM2MVersion>1.1</LWM2MVersion>
     <ObjectVersion>1.0</ObjectVersion>
     <MultipleInstances>Multiple</MultipleInstances>

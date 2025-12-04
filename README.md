@@ -1,9 +1,9 @@
 # LwM2M Send Scheduler Demo
 
 This project is a Zephyr-based sample that augments the base LwM2M client with
-an application-level scheduler. It demonstrates how to control time-series
-resource caching and SEND behaviour using custom LwM2M objects (vendor range
-20000/20001).
+the upstream send scheduler helper. It demonstrates how to control time-series
+resource caching and SEND behaviour using the Scheduler Control (10523) and
+Sampling Rules (10524) LwM2M objects now provided by Zephyr.
 
 ## Building & Running
 
@@ -29,7 +29,7 @@ west build -t run           # build + run
 
 ## Configuring Scheduler Rules
 
-The scheduler uses object 20001 instances to control cache behaviour for
+The scheduler uses object 10524 instances to control cache behaviour for
 specific resource paths. Each instance requires:
 
 - **Path string** (resource path like `/3303/0/5700`)
@@ -55,7 +55,7 @@ To experiment with the rules in a UI such as Eclipse Leshan:
 1. Import the DDF files from `ddf/send_scheduler.xml`. You can use the `-m`
 command argument to specify a path to load extra model for the Leshan demo
 server.
-2. Provision the `/20001/*` instances to point at `/3303/0/5700` or any other
+2. Provision the `/10524/*` instances to point at `/3303/0/5700` or any other
    resource you enable caching for in the application.
 3. Adjust rules live to observe how the scheduler throttles or injects samples.
 
