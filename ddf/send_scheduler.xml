@@ -69,7 +69,7 @@
         <Mandatory>Mandatory</Mandatory>
         <Type>Integer</Type>
         <RangeEnumeration></RangeEnumeration>
-        <Units>seconds</Units>
+        <Units>s</Units>
         <Description>Maximum age in seconds permitted for the oldest buffered sample before a transmission is forced.</Description>
       </Item>
       <Item ID="3">
